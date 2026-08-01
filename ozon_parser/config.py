@@ -1,17 +1,19 @@
 from pathlib import Path
 from typing import Literal
 
+from .paths import resource_root, writable_root
+
 BrowserMode = Literal["desktop", "mobile"]
 
 DESKTOP_MODE: BrowserMode = "desktop"
 MOBILE_MODE: BrowserMode = "mobile"
 
-BASE_DIR = Path(__file__).resolve().parent.parent
-ASSETS_DIR = BASE_DIR / "assets"
+BASE_DIR = writable_root()
+ASSETS_DIR = resource_root() / "assets"
 FONTS_DIR = ASSETS_DIR / "fonts"
-SESSION_DIR = BASE_DIR / "session"
 OUTPUT_DIR = Path(r"C:\Ozon")
-CHROME_OZON_PROFILE = Path(r"C:\Ozon\ChromeProfile")
+SESSION_DIR = OUTPUT_DIR / "session"
+CHROME_OZON_PROFILE = OUTPUT_DIR / "ChromeProfile"
 MOBILE_CHROME_PROFILE = SESSION_DIR / "mobile_browser_profile"
 
 MOBILE_BASE_URL = "https://m.ozon.ru"

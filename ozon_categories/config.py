@@ -4,7 +4,13 @@ from __future__ import annotations
 
 from pathlib import Path
 
-BASE_DIR = Path(__file__).resolve().parent.parent
+from ozon_parser.paths import is_frozen, writable_root
+
+if is_frozen():
+    BASE_DIR = Path(r"C:\Ozon")
+else:
+    BASE_DIR = writable_root()
+
 DEFAULT_CACHE_DIR = BASE_DIR / "cache" / "ozon_categories"
 DEFAULT_OUTPUT_DIR = BASE_DIR / "data" / "ozon_categories"
 

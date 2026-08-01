@@ -4,7 +4,8 @@ __pycache__/
 *.pyo
 dist/
 build/
-*.spec
 session/
 .idea/
 *.xlsx
+cache/
+data/
