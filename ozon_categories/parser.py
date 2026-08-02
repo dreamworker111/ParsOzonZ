@@ -183,30 +183,8 @@ def extract_direct_children(
                 if is_valid_category(str(c.get("name", "")), str(c.get("id", "")))
             ]
 
-    flat: list[dict[str, Any]] = []
-
-    def walk(nodes: list[dict[str, Any]]) -> None:
-        for n in nodes:
-            flat.append(n)
-            walk(n.get("children") or [])
-
-    walk(tree)
-
-    if page_category_id == parent_id:
-        candidates = [
-            n
-            for n in flat
-            if str(n.get("id")) != parent_id and str(n.get("id")) not in root_ids
-        ]
-        if not candidates:
-            candidates = [n for n in flat if str(n.get("id")) != parent_id]
-        if candidates:
-            return [
-                {"id": str(c["id"]), "name": c["name"], "url": c.get("url"), "children": []}
-                for c in candidates
-                if is_valid_category(str(c.get("name", "")), str(c.get("id", "")))
-            ]
-
+    # If the parent is absent, the response does not prove a relationship.
+    # Treating every other category as its child duplicates roots in branches.
     return []
 
 
@@ -270,11 +248,8 @@ def parse_html_category_block(html: str, parent_id: str | None = None) -> list[d
         if out:
             return out
 
-    return [
-        {"id": item["id"], "name": item["name"], "url": item["url"], "children": []}
-        for item in links
-        if item["id"] != parent_id
-    ]
+    # Do not infer children from unrelated links when the parent is absent.
+    return []
 
 
 def parse_page_all_sources(composer: dict[str, Any] | None, html: str | None, parent_id: str | None = None) -> list[dict[str, Any]]:

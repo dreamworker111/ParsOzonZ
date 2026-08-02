@@ -8,6 +8,8 @@ from PyQt6.QtWidgets import (
     QApplication,
     QCheckBox,
     QComboBox,
+    QDialog,
+    QDialogButtonBox,
     QDoubleSpinBox,
     QGridLayout,
     QGroupBox,
@@ -42,6 +44,12 @@ from ozon_parser.auth import has_mobile_saved_session
 from ozon_parser.export import ExportMeta, export_products
 from ozon_parser.login import login_mobile_via_browser
 from ozon_parser.parse_stats import ParseStatus
+from ozon_parser.instructions import INSTRUCTIONS_TITLE, build_user_instructions
+from ozon_parser.parse_checkpoint import (
+    CHECKPOINT_PATH,
+    clear_checkpoint,
+    describe_checkpoint,
+)
 from ozon_parser.parser import OzonParser, ParseSettings
 from ozon_parser.theme import (
     THEMES,
@@ -666,6 +674,15 @@ class MainWindow(QMainWindow):
         header.addWidget(title)
         header.addStretch()
 
+        self.help_btn = QPushButton("Инструкция")
+        self.help_btn.setObjectName("SecondaryButton")
+        self.help_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.help_btn.setMinimumWidth(130)
+        self.help_btn.setToolTip("Как пользоваться программой")
+        setup_action_button(self.help_btn, min_height=40)
+        self.help_btn.clicked.connect(self._show_instructions)
+        header.addWidget(self.help_btn)
+
         self.theme_btn = QPushButton()
         self.theme_btn.setObjectName("SecondaryButton")
         self.theme_btn.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -748,9 +765,9 @@ class MainWindow(QMainWindow):
         price_row.addLayout(price_col_r)
         params_layout.addLayout(price_row)
 
-        params_layout.addWidget(QLabel("Количество товаров (на категорию)"))
+        params_layout.addWidget(QLabel("Количество товаров с баллами (на категорию)"))
         self.max_products = QSpinBox()
-        self.max_products.setRange(1, 10000)
+        self.max_products.setRange(1, 100000)
         self.max_products.setValue(100)
         params_layout.addWidget(self.max_products)
 
@@ -1019,6 +1036,32 @@ class MainWindow(QMainWindow):
         self._refresh_theme_button()
         self._apply_styles()
 
+    def _show_instructions(self) -> None:
+        dialog = QDialog(self)
+        dialog.setWindowTitle(INSTRUCTIONS_TITLE)
+        dialog.setModal(True)
+        dialog.resize(640, 560)
+
+        layout = QVBoxLayout(dialog)
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(12)
+
+        title = QLabel(INSTRUCTIONS_TITLE)
+        title.setObjectName("AppTitle")
+        layout.addWidget(title)
+
+        text = QPlainTextEdit()
+        text.setReadOnly(True)
+        text.setPlainText(build_user_instructions())
+        text.setLineWrapMode(QPlainTextEdit.LineWrapMode.WidgetWidth)
+        layout.addWidget(text, stretch=1)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok)
+        buttons.accepted.connect(dialog.accept)
+        layout.addWidget(buttons)
+
+        dialog.exec()
+
     def _append_log(self, message: str) -> None:
         text = message.strip()
         if not text:
@@ -1127,16 +1170,17 @@ class MainWindow(QMainWindow):
 
     def _show_manual_bypass_dialog(self, incident: str) -> None:
         msg = (
-            "Ozon заблокировал доступ (это не проблема интернета).\n\n"
+            "Ozon проверяет браузер или временно ограничил доступ.\n\n"
         )
         if incident:
             msg += f"Инцидент: {incident}\n\n"
         msg += (
             "В окне Chrome:\n"
-            "1. Нажмите F5 (обновить страницу)\n"
-            "2. Пройдите проверку, если появится\n"
-            "3. Дождитесь нормальной загрузки Ozon\n"
-            "4. Нажмите OK здесь"
+            "1. Если видите «Antibot Challenge» — дождитесь завершения проверки\n"
+            "2. Не обновляйте страницу многократно\n"
+            "3. При «Инциденте» подождите 15–30 минут, затем обновите один раз\n"
+            "4. Нажмите OK только после нормальной загрузки Ozon\n\n"
+            "Если доступ не восстановился, парсер остановится без новых запросов."
         )
         QMessageBox.information(self, "Требуется ваше действие", msg)
 
@@ -1213,6 +1257,7 @@ class MainWindow(QMainWindow):
         use_auth = self._selected_use_auth()
         self._catalog_subcat_total = 0
         self.load_cat_btn.setEnabled(False)
+        self.start_btn.setEnabled(False)
         self.specific_seller_checkbox.setEnabled(False)
         self.rename_cat_btn.setEnabled(False)
         self.status_label.setText("Загрузка категорий...")
@@ -1259,7 +1304,14 @@ class MainWindow(QMainWindow):
     def _on_subcategories_begin(self, total: int) -> None:
         self._catalog_subcat_total = total
         self._catalog_subcat_done = 0
-        self._append_log(f"Загрузка подкатегорий для {total} категорий (до 15 мин)...")
+        if self._loaded_specific_seller is False:
+            self._append_log(
+                f"Полный обход всех веток каталога: {total} корневых категорий..."
+            )
+        else:
+            self._append_log(
+                f"Загрузка подкатегорий для {total} категорий (до 15 мин)..."
+            )
 
     def _on_category_branch_loaded(self, node) -> None:
         self.category_tree.update_category_branch(node)
@@ -1268,6 +1320,7 @@ class MainWindow(QMainWindow):
         self.category_tree.finalize_catalog_load(categories)
         self.category_tree.expandToDepth(4)
         self.load_cat_btn.setEnabled(True)
+        self.start_btn.setEnabled(True)
         self.specific_seller_checkbox.setEnabled(True)
         self._update_rename_category_button(self.category_tree.currentItem())
         sub_count = self._count_subcategories(categories)
@@ -1275,8 +1328,8 @@ class MainWindow(QMainWindow):
         with_subcats = sum(1 for c in categories if c.children)
         if self._loaded_specific_seller is False:
             self.status_label.setText(
-                f"Общий каталог загружен: {len(categories)} разделов, "
-                f"{sub_count} подкатегорий. Товары будут собраны у всех продавцов."
+                f"Полный каталог загружен: {len(categories)} разделов, "
+                f"{sub_count} подкатегорий/веток. Товары будут собраны у всех продавцов."
             )
         elif total and with_subcats < total:
             self.status_label.setText(
@@ -1294,6 +1347,7 @@ class MainWindow(QMainWindow):
 
     def _on_categories_failed(self, error: str) -> None:
         self.load_cat_btn.setEnabled(True)
+        self.start_btn.setEnabled(True)
         self.specific_seller_checkbox.setEnabled(True)
         self._update_rename_category_button(self.category_tree.currentItem())
         self._loaded_category_mode = None
@@ -1301,10 +1355,10 @@ class MainWindow(QMainWindow):
         self._loaded_specific_seller = None
         self.status_label.setText(f"Ошибка загрузки категорий: {error}")
         hint = (
-            "Ozon заблокировал доступ.\n\n"
+            "Ozon заблокировал доступ (это не ошибка интернета).\n\n"
             "1. Нажмите «Открыть Chrome для Ozon»\n"
-            "2. Дождитесь загрузки сайта в Chrome\n"
-            "3. Если видите «нет соединения» — обновите страницу (F5)\n"
+            "2. Если видите fab_/«Похоже, нет соединения» — подождите 15–30 минут\n"
+            "3. Обновите страницу один раз только после ожидания\n"
             "4. Повторите «Загрузить категории»"
         )
         if "нет соединения" in error.lower() or "заблокировал" in error.lower():
@@ -1357,6 +1411,31 @@ class MainWindow(QMainWindow):
             )
             return
 
+        if not specific_seller and len(categories) >= 50:
+            self._append_log(
+                f"Выбрано категорий: {len(categories)}. "
+                "Для общего каталога сессии короткие (1 категория за запуск), "
+                "чтобы избежать fab_/«Похоже, нет соединения». "
+                "Продолжайте повторными запусками с checkpoint."
+            )
+            answer = QMessageBox.question(
+                self,
+                "Большой выбор категорий",
+                (
+                    f"Выбрано {len(categories)} категорий общего каталога.\n\n"
+                    "Чтобы не получать инцидент fab_, за одну сессию будет "
+                    "обработана только 1 категория. Прогресс сохранится — "
+                    "запускайте парсер снова, пока не пройдёте все.\n\n"
+                    "Перед стартом откройте Chrome и убедитесь, что Ozon "
+                    "открывается без «Похоже, нет соединения».\n\n"
+                    "Продолжить?"
+                ),
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.Yes,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+
         min_p = self.min_price.value() if self.min_price.value() > 0 else None
         max_p = self.max_price.value() if self.max_price.value() < 999999 else None
 
@@ -1373,6 +1452,29 @@ class MainWindow(QMainWindow):
             specific_seller=specific_seller,
         )
 
+        resume_info = describe_checkpoint(settings)
+        if resume_info:
+            answer = QMessageBox.question(
+                self,
+                "Продолжить сохранённый сбор?",
+                (
+                    f"Найден сохранённый прогресс: {resume_info}.\n\n"
+                    "Да — продолжить с того же места.\n"
+                    "Нет — начать заново (прогресс будет очищен)."
+                ),
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.Yes,
+            )
+            if answer == QMessageBox.StandardButton.No:
+                clear_checkpoint()
+                self._append_log("Старый прогресс очищен — старт с нуля")
+            else:
+                self._append_log(f"Продолжение: {resume_info}")
+        elif CHECKPOINT_PATH.exists():
+            self._append_log(
+                "Старый файл прогресса не подходит к текущим параметрам и будет игнорирован"
+            )
+
         export_meta = ExportMeta(
             seller_url=url if specific_seller else "Все магазины Ozon",
             min_price=min_p,
@@ -1383,7 +1485,10 @@ class MainWindow(QMainWindow):
 
         self._reset_parse_display()
         self.log_view.clear()
-        self._append_log("Запуск парсера...")
+        self._append_log(
+            "Запуск безопасной сессии: короткие партии, сохранение прогресса, "
+            "без открытия карточек товаров."
+        )
         self._set_app_status(self.STATUS_PARSING, parsing=True)
         self.parser = OzonParser()
         self.parse_worker = ParseWorker(settings, self.parser, export_meta)
@@ -1436,18 +1541,30 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "Готово", f"Товары не найдены\n\nВремя: {duration_text}")
             return
         abs_path = filepath
-        self.status_label.setText(
-            f"Готово! {len(products)} товаров за {duration_text}. Нажмите «Скачать XLSX»."
+        has_checkpoint = CHECKPOINT_PATH.exists()
+        status = (
+            f"Сессия: {len(products)} товаров за {duration_text}. "
+            + (
+                "Прогресс сохранён — запустите снова для продолжения."
+                if has_checkpoint
+                else "Сбор завершён. Нажмите «Скачать XLSX»."
+            )
         )
-        self._append_log(f"Готово: {len(products)} товаров за {duration_text}")
+        self.status_label.setText(status)
+        self._append_log(status)
         if stats and stats.section_timings:
             for timing in stats.section_timings:
                 self._append_log(timing.summary_line())
-        QMessageBox.information(
-            self,
-            "Готово",
-            f"Сохранено {len(products)} товаров\nВремя парсинга: {duration_text}\n\n{abs_path}",
+        message = (
+            f"Сохранено {len(products)} товаров\n"
+            f"Время сессии: {duration_text}\n\n{abs_path}"
         )
+        if has_checkpoint:
+            message += (
+                "\n\nПрогресс сохранён. Чтобы набрать большой объём, "
+                "запускайте парсер снова с теми же категориями после паузы."
+            )
+        QMessageBox.information(self, "Сессия завершена", message)
 
     def _on_parse_failed(self, error: str) -> None:
         self._set_app_status(self.STATUS_IDLE, parsing=False)

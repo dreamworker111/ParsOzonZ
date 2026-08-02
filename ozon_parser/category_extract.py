@@ -225,36 +225,8 @@ def extract_direct_children(
                 if is_valid_category(str(c.get("name", "")), str(c.get("id", "")))
             ]
 
-    flat: list[dict] = []
-
-    def walk(nodes: list[dict]) -> None:
-        for n in nodes:
-            flat.append(n)
-            walk(n.get("children") or [])
-
-    walk(tree)
-
-    if page_category_id == parent_id:
-        candidates = [
-            n
-            for n in flat
-            if str(n.get("id")) != parent_id and str(n.get("id")) not in root_ids
-        ]
-        if not candidates:
-            candidates = [n for n in flat if str(n.get("id")) != parent_id]
-        if candidates:
-            child_ids: set[str] = set()
-            for item in candidates:
-                for sub in item.get("children") or []:
-                    child_ids.add(str(sub.get("id")))
-            top = [n for n in candidates if str(n.get("id")) not in child_ids]
-            use = top or candidates
-            return [
-                {"id": str(c["id"]), "name": c["name"], "url": c.get("url"), "children": []}
-                for c in use
-                if is_valid_category(str(c.get("name", "")), str(c.get("id", "")))
-            ]
-
+    # No parent means no proven parent-child relation. Returning unrelated
+    # categories here caused every root category to be copied into branches.
     return []
 
 

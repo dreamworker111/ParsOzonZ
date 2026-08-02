@@ -1,4 +1,5 @@
 import re
+import random
 import threading
 from dataclasses import dataclass, field
 from typing import Callable
@@ -8,7 +9,10 @@ from playwright.sync_api import Page, sync_playwright
 
 from .browser import (
     close_session_context,
+    ensure_ozon_session_ready,
+    is_access_restricted,
     is_blocked_page,
+    is_captcha_page,
     is_seller_page,
     open_session_context,
     recover_access,
@@ -19,11 +23,39 @@ from .parse_stats import ParseStats, ParseStatus, ParseTimer, SectionTiming, for
 from .config import (
     ALL_SELLERS_PATH,
     BrowserMode,
+    CHECKPOINT_SAVE_EVERY_PRODUCTS,
     DESKTOP_MODE,
+    GLOBAL_BETWEEN_CATEGORIES_MAX,
+    GLOBAL_BETWEEN_CATEGORIES_MIN,
+    GLOBAL_CATALOG_PATH,
+    GLOBAL_FIRST_CATEGORY_PAUSE_MAX,
+    GLOBAL_FIRST_CATEGORY_PAUSE_MIN,
+    GLOBAL_LARGE_SELECTION_THRESHOLD,
+    GLOBAL_SAFE_CATEGORY_BATCH_SIZE,
+    GLOBAL_SAFE_CATEGORY_BREAK_MAX,
+    GLOBAL_SAFE_CATEGORY_BREAK_MIN,
+    GLOBAL_SESSION_MAX_CATEGORIES,
+    GLOBAL_SESSION_MAX_PRODUCTS,
     MAX_CATEGORY_RETRIES,
+    MAX_PRODUCT_DETAIL_FETCHES,
     MOBILE_MODE,
+    SAFE_CATEGORY_BATCH_SIZE,
+    SAFE_CATEGORY_BREAK_MAX,
+    SAFE_CATEGORY_BREAK_MIN,
+    SAFE_GOTO_MAX_RETRIES,
+    SAFE_SCROLL_BATCH_SIZE,
+    SAFE_SCROLL_BREAK_MAX,
+    SAFE_SCROLL_BREAK_MIN,
+    SESSION_MAX_CATEGORIES,
+    SESSION_MAX_PRODUCTS,
 )
 from .export import ProductRow
+from .parse_checkpoint import (
+    clear_checkpoint,
+    load_checkpoint,
+    save_checkpoint,
+    target_key,
+)
 from .session import resolve_storage_state
 from .utils import (
     has_bonus_text,
@@ -36,6 +68,7 @@ from .utils import (
     parse_price,
     to_desktop_product_url,
     to_browser_url,
+    route_browser_url,
     with_price_sort_asc,
 )
 
@@ -83,11 +116,81 @@ class OzonParser:
         self._parse_index = 0
         self._parse_total = 0
 
+    def _route_url(self, url: str, browser_mode: BrowserMode) -> str:
+        return route_browser_url(url, browser_mode, self._session_mode)
+
     def stop(self) -> None:
         self._stop_event.set()
 
     def is_stopped(self) -> bool:
         return self._stop_event.is_set()
+
+    def _protective_pause(self, minimum: float, maximum: float, message: str) -> bool:
+        seconds = random.uniform(minimum, maximum)
+        self.on_progress(f"{message}: {int(seconds)} сек.")
+        return not self._stop_event.wait(seconds)
+
+    def _session_budgets(self, settings: ParseSettings) -> tuple[int, int]:
+        """Short sessions reduce ban risk; big goals are finished via resume."""
+        category_count = len(settings.categories or [])
+        if not settings.specific_seller:
+            cats = GLOBAL_SESSION_MAX_CATEGORIES
+            products = GLOBAL_SESSION_MAX_PRODUCTS
+            if category_count >= GLOBAL_LARGE_SELECTION_THRESHOLD:
+                cats = 1
+                products = min(products, 80)
+            return cats, min(products, settings.max_products)
+        if settings.max_products >= 5000:
+            return min(SESSION_MAX_CATEGORIES, 3), min(SESSION_MAX_PRODUCTS, 250)
+        if settings.max_products >= 1000:
+            return SESSION_MAX_CATEGORIES, SESSION_MAX_PRODUCTS
+        return SESSION_MAX_CATEGORIES, min(SESSION_MAX_PRODUCTS, settings.max_products)
+
+    def _category_batch_settings(self, settings: ParseSettings) -> tuple[int, float, float]:
+        if not settings.specific_seller:
+            return (
+                GLOBAL_SAFE_CATEGORY_BATCH_SIZE,
+                GLOBAL_SAFE_CATEGORY_BREAK_MIN,
+                GLOBAL_SAFE_CATEGORY_BREAK_MAX,
+            )
+        return SAFE_CATEGORY_BATCH_SIZE, SAFE_CATEGORY_BREAK_MIN, SAFE_CATEGORY_BREAK_MAX
+
+    def _pause_before_category(
+        self,
+        settings: ParseSettings,
+        session_started: int,
+    ) -> bool:
+        """Protective pause before opening the next category page."""
+        batch_size, break_min, break_max = self._category_batch_settings(settings)
+        if session_started == 0 and not settings.specific_seller:
+            return self._protective_pause(
+                GLOBAL_FIRST_CATEGORY_PAUSE_MIN,
+                GLOBAL_FIRST_CATEGORY_PAUSE_MAX,
+                "Пауза перед первой категорией общего каталога",
+            )
+        if session_started > 0 and session_started % batch_size == 0:
+            return self._protective_pause(
+                break_min,
+                break_max,
+                "Защитная пауза после группы категорий",
+            )
+        if session_started > 0:
+            self.on_progress("Пауза перед следующим фильтром...")
+            if not settings.specific_seller:
+                human_delay(GLOBAL_BETWEEN_CATEGORIES_MIN, GLOBAL_BETWEEN_CATEGORIES_MAX)
+            else:
+                human_category_delay()
+        return True
+
+    def _persist_progress(
+        self,
+        settings: ParseSettings,
+        completed_targets: set[str],
+        products: list[ProductRow],
+    ) -> list[ProductRow]:
+        products = self._dedupe_products(products)
+        save_checkpoint(settings, completed_targets, products)
+        return products
 
     def _open_browser(
         self,
@@ -117,14 +220,56 @@ class OzonParser:
             self.on_progress("Подключено к Chrome")
         elif mode == "ozon_persistent":
             self.on_progress("Подключено через профиль Chrome для Ozon")
+        elif mode == "mobile_guest_cdp":
+            self.on_progress("Мобильный режим через Chrome для Ozon")
+        self._session_mode = mode
         return browser, context, page, mode
 
     def run(self, settings: ParseSettings) -> tuple[list[ProductRow], ParseStats]:
         self._stop_event.clear()
         products: list[ProductRow] = []
         state = _ParseState()
+        completed_targets: set[str] = set()
         stats = ParseStats()
         timer = ParseTimer()
+        session_cats, session_products = self._session_budgets(settings)
+        session_started = 0
+        products_at_session_start = 0
+
+        checkpoint = load_checkpoint(settings)
+        if checkpoint:
+            products = self._dedupe_products(checkpoint.products)
+            completed_targets = set(checkpoint.completed_targets)
+            state.seen_urls = {
+                self._canonical_product_url(product.url) for product in products
+            }
+            self.on_progress(
+                f"Продолжение сохранённого сбора: {len(products)} товаров, "
+                f"{len(completed_targets)} категорий завершено"
+            )
+
+        products_at_session_start = len(products)
+        category_count = len(settings.categories or [])
+        mode_hint = (
+            "общий каталог (все магазины)"
+            if not settings.specific_seller
+            else "конкретный магазин"
+        )
+        self.on_progress(
+            f"Безопасный режим ({mode_hint}): только карточки каталога, "
+            "без открытия карточек товаров. "
+            f"Выбрано категорий: {category_count}. "
+            f"За сессию до {session_cats} категорий / +{session_products} товаров; "
+            "остальное — через повторный запуск."
+        )
+        if (
+            not settings.specific_seller
+            and category_count >= GLOBAL_LARGE_SELECTION_THRESHOLD
+        ):
+            self.on_progress(
+                "Большой выбор категорий: сессии укорочены, чтобы не получать "
+                "инцидент fab_/«Похоже, нет соединения». Продолжайте повторными запусками."
+            )
 
         with sync_playwright() as playwright:
             self._browser, self._context, self._page, self._session_mode = self._open_browser(
@@ -140,9 +285,10 @@ class OzonParser:
                     normalize_seller_url(
                         settings.seller_url,
                         settings.browser_mode,
+                        self._session_mode,
                     )
                     if settings.specific_seller
-                    else to_browser_url(
+                    else self._route_url(
                         "https://www.ozon.ru" + ALL_SELLERS_PATH,
                         settings.browser_mode,
                     )
@@ -152,15 +298,103 @@ class OzonParser:
                     self.on_progress("Фильтры не выбраны — парсинг остановлен")
                     return products, stats
 
+                if not ensure_ozon_session_ready(
+                    self._page,
+                    self.on_progress,
+                    warmup_url=seller_url,
+                    on_manual_bypass=self.on_manual_bypass,
+                ):
+                    self.on_progress(
+                        "Ozon не готов к парсингу. Откройте Chrome, дождитесь загрузки "
+                        "сайта без «Похоже, нет соединения» / fab_ и повторите."
+                    )
+                    self._persist_progress(settings, completed_targets, products)
+                    stats.total_duration_sec = timer.total_elapsed
+                    return products, stats
+
+                if is_access_restricted(self._page):
+                    self.on_progress(
+                        "Ozon проверяет браузер или ограничил доступ (fab_). "
+                        "Подтвердите в Chrome и нажмите «Продолжить»."
+                    )
+                    self._persist_progress(settings, completed_targets, products)
+                    if not recover_access(
+                        self._page,
+                        self.on_progress,
+                        self.on_manual_bypass,
+                        seller_url,
+                    ):
+                        stats.total_duration_sec = timer.total_elapsed
+                        return products, stats
+                    if not ensure_ozon_session_ready(
+                        self._page,
+                        self.on_progress,
+                        warmup_url=seller_url,
+                        on_manual_bypass=self.on_manual_bypass,
+                    ):
+                        stats.total_duration_sec = timer.total_elapsed
+                        return products, stats
+
+                # Avoid a bare /seller/ hop before the first category URL.
+                # First pending target already opens /seller/?category=… once.
+                if settings.specific_seller and not is_seller_page(self._page):
+                    if not safe_goto(
+                        self._page,
+                        seller_url,
+                        self.on_progress,
+                        max_retries=SAFE_GOTO_MAX_RETRIES,
+                        on_manual_bypass=self.on_manual_bypass,
+                    ):
+                        self.on_progress(
+                            "Не удалось открыть страницу магазина без блокировки. "
+                            "Прогресс сохранён — подождите 15–30 минут и продолжите."
+                        )
+                        self._persist_progress(settings, completed_targets, products)
+                        stats.total_duration_sec = timer.total_elapsed
+                        return products, stats
+
                 total = len(categories)
                 timer.reset()
+                interrupted = False
+                goal_reached = len(products) >= settings.max_products
+                session_limit_hit = False
+
                 for idx, target in enumerate(categories, start=1):
+                    if goal_reached or session_limit_hit:
+                        break
                     if self.is_stopped():
+                        interrupted = True
                         break
 
-                    if idx > 1:
-                        self.on_progress("Пауза перед следующим фильтром...")
-                        human_category_delay()
+                    key = target_key(target)
+                    if key in completed_targets:
+                        self.on_progress(
+                            f"Пропуск завершённой категории {idx}/{total}: "
+                            f"{target.name or target.id}"
+                        )
+                        continue
+
+                    if session_started >= session_cats:
+                        session_limit_hit = True
+                        interrupted = True
+                        self.on_progress(
+                            f"Лимит сессии: {session_cats} категорий из {total}. "
+                            "Прогресс сохранён — запустите парсер снова позже."
+                        )
+                        break
+
+                    if not self._pause_before_category(settings, session_started):
+                        interrupted = True
+                        break
+
+                    if is_access_restricted(self._page):
+                        self.on_progress(
+                            "Обнаружен fab_/блокировка перед открытием категории. "
+                            "Сессия остановлена без повторных запросов."
+                        )
+                        self._persist_progress(settings, completed_targets, products)
+                        interrupted = True
+                        break
 
                     section, category_label, item_label = self._target_labels(target)
                     timer.restart_section()
@@ -181,10 +415,43 @@ class OzonParser:
                             target,
                             settings.browser_mode,
                         )
-                    batch = self._parse_catalog_with_retry(
-                        catalog_url, settings, state, target,
+
+                    def on_batch_progress(batch_products: list[ProductRow]) -> None:
+                        nonlocal products
+                        combined = self._dedupe_products(products + batch_products)
+                        self._persist_progress(settings, completed_targets, combined)
+
+                    remaining_goal = max(0, settings.max_products - len(products))
+                    remaining_session = max(
+                        0,
+                        session_products - (len(products) - products_at_session_start),
+                    )
+                    category_cap = min(remaining_goal, remaining_session)
+                    if category_cap <= 0:
+                        session_limit_hit = True
+                        interrupted = True
+                        break
+
+                    batch, category_completed = self._parse_catalog_with_retry(
+                        catalog_url,
+                        settings,
+                        state,
+                        target,
+                        product_cap=category_cap,
+                        on_progress_save=on_batch_progress,
                     )
                     products.extend(batch)
+                    products = self._persist_progress(
+                        settings,
+                        completed_targets,
+                        products,
+                    )
+                    session_started += 1
+                    if category_completed:
+                        completed_targets.add(key)
+                        self._persist_progress(settings, completed_targets, products)
+                    else:
+                        interrupted = True
 
                     duration = timer.section_elapsed
                     stats.section_timings.append(
@@ -201,11 +468,45 @@ class OzonParser:
                     self.on_progress(
                         f"Готово {idx}/{total}: {section} — {item_label} | "
                         f"{len(batch)} тов. за {format_duration(duration)} | "
-                        f"всего {format_duration(timer.total_elapsed)}"
+                        f"всего собрано {len(products)}"
                     )
                     self._emit_status(
                         timer, idx, total, section, category_label, item_label,
                         message=f"Завершено: {len(batch)} товаров",
+                    )
+                    if not category_completed:
+                        self.on_progress(
+                            "Сбор приостановлен. Прогресс сохранён; следующий запуск "
+                            "продолжит с незавершённых категорий"
+                        )
+                        break
+                    if len(products) >= settings.max_products:
+                        goal_reached = True
+                        self.on_progress(
+                            f"Достигнут общий лимит: {settings.max_products} товаров"
+                        )
+                        break
+                    gained = len(products) - products_at_session_start
+                    if gained >= session_products:
+                        session_limit_hit = True
+                        interrupted = True
+                        self.on_progress(
+                            f"Лимит сессии: +{session_products} товаров. "
+                            "Прогресс сохранён — продолжите позже повторным запуском."
+                        )
+                        break
+
+                all_target_keys = {target_key(target) for target in categories}
+                if goal_reached or (
+                    not interrupted and all_target_keys.issubset(completed_targets)
+                ):
+                    clear_checkpoint()
+                    self.on_progress("Контрольная точка очищена — сбор завершён")
+                else:
+                    self._persist_progress(settings, completed_targets, products)
+                    self.on_progress(
+                        f"Прогресс сохранён: {len(products)}/{settings.max_products} товаров. "
+                        "Запустите парсер снова с теми же категориями для продолжения."
                     )
             finally:
                 if self._context:
@@ -213,7 +514,7 @@ class OzonParser:
 
         stats.total_duration_sec = timer.total_elapsed
         products = self._dedupe_products(products)
-        self.on_progress(f"Парсинг завершён за {stats.total_duration_fmt}")
+        self.on_progress(f"Сессия завершена за {stats.total_duration_fmt}")
         return products, stats
 
     def _dedupe_products(self, products: list[ProductRow]) -> list[ProductRow]:
@@ -279,7 +580,17 @@ class OzonParser:
                 browser_mode=browser_mode,
             )
             try:
-                loader = CategoryLoader(page, browser_mode)
+                if not ensure_ozon_session_ready(
+                    page,
+                    self.on_progress,
+                    on_manual_bypass=self.on_manual_bypass,
+                ):
+                    raise ConnectionError(
+                        "Ozon не готов к загрузке категорий. "
+                        "Откройте Chrome, дождитесь нормальной загрузки сайта "
+                        "без Antibot Challenge и повторите."
+                    )
+                loader = CategoryLoader(page, browser_mode, session_mode=mode)
                 if specific_seller:
                     return loader.load_category_tree(
                         seller_url,
@@ -293,6 +604,7 @@ class OzonParser:
                     self.on_progress,
                     self.on_manual_bypass,
                     on_roots=on_roots,
+                    on_subcategories_begin=on_subcategories_begin,
                     on_branch=on_branch,
                 )
             finally:
@@ -314,7 +626,7 @@ class OzonParser:
                 browser_mode=browser_mode,
             )
             try:
-                loader = CategoryLoader(page, browser_mode)
+                loader = CategoryLoader(page, browser_mode, session_mode=mode)
                 return loader.load_subcategories_for_categories(
                     seller_url, categories, self.on_progress, self.on_manual_bypass,
                 )
@@ -337,7 +649,7 @@ class OzonParser:
                 browser_mode=browser_mode,
             )
             try:
-                loader = CategoryLoader(page, browser_mode)
+                loader = CategoryLoader(page, browser_mode, session_mode=mode)
                 return loader.load_filters_for_categories(
                     seller_url, categories, self.on_progress, self.on_manual_bypass,
                 )
@@ -356,28 +668,57 @@ class OzonParser:
             parsed = urlparse(base)
             query = urlencode({param_key: param_value, "sorting": "price"})
             return urlunparse((parsed.scheme, parsed.netloc, parsed.path, "", query, ""))
-        return with_price_sort_asc(base, browser_mode)
+        return with_price_sort_asc(base, browser_mode, self._session_mode)
+
+    def _global_category_parse_url(
+        self,
+        category_id: str,
+        browser_mode: BrowserMode = DESKTOP_MODE,
+    ) -> str:
+        """Build a seller-filter URL for global catalogue parsing (fewer blocks than /category/)."""
+        seller = self._route_url(f"https://www.ozon.ru{ALL_SELLERS_PATH}", browser_mode)
+        parsed = urlparse(seller)
+        query = urlencode({"category": str(category_id)})
+        base = urlunparse((parsed.scheme, parsed.netloc, parsed.path, "", query, ""))
+        return with_price_sort_asc(base, browser_mode, self._session_mode)
+
+    def _resolve_global_category_id(self, target: CategoryTarget) -> str:
+        for candidate in (target.category_id, target.param_value):
+            value = str(candidate or "").strip()
+            if re.fullmatch(r"\d{2,}", value):
+                return value
+        target_id = str(target.id or "")
+        match = re.search(r"category:(\d+)", target_id)
+        if match:
+            return match.group(1)
+        if target.url and GLOBAL_CATALOG_PATH in target.url:
+            match = re.search(r"/category/(\d+)", target.url)
+            if match:
+                return match.group(1)
+        return ""
 
     def _build_global_catalog_url(
         self,
         target: CategoryTarget,
         browser_mode: BrowserMode = DESKTOP_MODE,
     ) -> str:
-        category_id = target.category_id or target.param_value or target.id
-        all_sellers = to_browser_url(
-            "https://www.ozon.ru" + ALL_SELLERS_PATH,
-            browser_mode,
-        )
+        # Seller filter pages survive antibot checks better than direct /category/ URLs.
+        category_id = self._resolve_global_category_id(target)
         if category_id:
-            return self._build_catalog_url(
-                all_sellers,
-                "category",
-                category_id,
-                browser_mode,
-            )
-        return with_price_sort_asc(all_sellers, browser_mode)
+            return self._global_category_parse_url(category_id, browser_mode)
+        return with_price_sort_asc(
+            self._route_url("https://www.ozon.ru" + ALL_SELLERS_PATH, browser_mode),
+            browser_mode,
+            self._session_mode,
+        )
 
     def _ensure_price_sort_asc(self, page: Page) -> None:
+        try:
+            current = (page.url or "").lower()
+        except Exception:
+            current = ""
+        if "sorting=price" in current or "sorting%3dprice" in current:
+            return
         selectors = (
             'button:has-text("По возрастанию цены")',
             'span:has-text("По возрастанию цены")',
@@ -404,24 +745,57 @@ class OzonParser:
         settings: ParseSettings,
         state: _ParseState,
         category: CategoryTarget | None = None,
-    ) -> list[ProductRow]:
+        product_cap: int | None = None,
+        on_progress_save: Callable[[list[ProductRow]], None] | None = None,
+    ) -> tuple[list[ProductRow], bool]:
+        collected: list[ProductRow] = []
         for attempt in range(1, MAX_CATEGORY_RETRIES + 1):
             if self.is_stopped():
-                return []
+                return self._dedupe_products(collected), False
 
-            results, loaded = self._parse_catalog(url, settings, state, category)
-            if loaded:
-                return results
+            results, loaded = self._parse_catalog(
+                url,
+                settings,
+                state,
+                category,
+                product_cap=product_cap,
+                on_progress_save=on_progress_save,
+            )
+            collected.extend(results)
+            collected = self._dedupe_products(collected)
+            if loaded and not self.is_stopped():
+                return collected, True
+            if self._page and is_access_restricted(self._page):
+                return collected, False
             if attempt < MAX_CATEGORY_RETRIES:
+                if not self._page:
+                    self.on_progress("Страница браузера недоступна — парсинг остановлен")
+                    return collected, False
                 self.on_progress(f"Страница не загрузилась, повтор {attempt + 1}...")
-                assert self._page
-                recover_access(
+                if is_access_restricted(self._page):
+                    return collected, False
+                if not recover_access(
                     self._page,
                     self.on_progress,
                     self.on_manual_bypass,
-                    to_browser_url(url, settings.browser_mode),
-                )
-        return []
+                    self._route_url(url, settings.browser_mode),
+                ):
+                    return collected, False
+        return collected, False
+
+    def _soft_goto_seller_category(
+        self,
+        page: Page,
+        routed_url: str,
+    ) -> bool:
+        """Switch seller category with a single navigation and no auto-retries."""
+        return safe_goto(
+            page,
+            routed_url,
+            self.on_progress,
+            max_retries=SAFE_GOTO_MAX_RETRIES,
+            on_manual_bypass=self.on_manual_bypass,
+        )
 
     def _navigate_to_catalog(
         self,
@@ -429,12 +803,21 @@ class OzonParser:
         target: CategoryTarget | None,
         catalog_url: str,
         browser_mode: BrowserMode = DESKTOP_MODE,
+        *,
+        specific_seller: bool = True,
     ) -> bool:
-        routed_url = to_browser_url(catalog_url, browser_mode)
+        routed_url = self._route_url(catalog_url, browser_mode)
         if target:
             self.on_progress(
                 f"Открываем выбранную категорию: {target.name or target.id}"
             )
+            self.on_progress(f"URL каталога: {routed_url}")
+
+        # Global catalogue: always use one seller-filter navigation.
+        # Extra /seller/ hops and UI clicks increase fab_ risk.
+        if not specific_seller:
+            return self._soft_goto_seller_category(page, routed_url)
+
         if target and is_seller_page(page):
             selectors: list[str] = []
             query = urlparse(target.url).query if target.url else ""
@@ -456,7 +839,7 @@ class OzonParser:
                         self.on_progress(f"Переход: {section} — {target.name or target.id}")
                         link.click()
                         human_delay(2.0, 4.0)
-                        if is_blocked_page(page):
+                        if is_access_restricted(page):
                             return False
                         current = page.url.lower()
                         if target.param_key and target.param_value:
@@ -472,6 +855,7 @@ class OzonParser:
             page,
             routed_url,
             self.on_progress,
+            max_retries=SAFE_GOTO_MAX_RETRIES,
             on_manual_bypass=self.on_manual_bypass,
         )
 
@@ -481,44 +865,57 @@ class OzonParser:
         settings: ParseSettings,
         state: _ParseState,
         category: CategoryTarget | None = None,
+        product_cap: int | None = None,
+        on_progress_save: Callable[[list[ProductRow]], None] | None = None,
     ) -> tuple[list[ProductRow], bool]:
         assert self._page is not None
         page = self._page
         results: list[ProductRow] = []
-        routed_url = with_price_sort_asc(url, settings.browser_mode)
+        routed_url = self._route_url(url, settings.browser_mode)
         target = category
+        hard_cap = product_cap if product_cap is not None else settings.max_products
+        last_saved_count = 0
 
         if not self._navigate_to_catalog(
             page,
             target,
             routed_url,
             settings.browser_mode,
+            specific_seller=settings.specific_seller,
         ):
-            if not recover_access(page, self.on_progress, self.on_manual_bypass, routed_url):
+            if self._page and is_access_restricted(self._page):
+                self.on_progress(
+                    "Ozon показал fab_/«Похоже, нет соединения» — временная блокировка, "
+                    "не ошибка интернета. Прогресс сохранён; подождите 15–30 минут "
+                    "и продолжите без повторных обновлений страницы."
+                )
+                # Do not auto-retry navigation while an incident is active.
                 return results, False
-            if not self._navigate_to_catalog(
-                page,
-                target,
-                routed_url,
-                settings.browser_mode,
-            ):
-                return results, False
+            # Generic navigation failure: stop without a second blind goto.
+            self.on_progress(
+                "Не удалось открыть категорию. Прогресс сохранён — повторите позже."
+            )
+            return results, False
 
         self._ensure_price_sort_asc(page)
 
         empty_rounds = 0
+        scroll_rounds = 0
         processed: set[str] = set()
+        exhausted = False
+        capped = False
 
-        while not self.is_stopped() and len(results) < settings.max_products and empty_rounds < 4:
-            if is_blocked_page(page):
-                if not recover_access(page, self.on_progress, self.on_manual_bypass, routed_url):
-                    break
-                self._navigate_to_catalog(
-                    page,
-                    target,
-                    routed_url,
-                    settings.browser_mode,
+        while (
+            not self.is_stopped()
+            and len(results) < hard_cap
+            and empty_rounds < 4
+        ):
+            if is_access_restricted(page):
+                self.on_progress(
+                    "Во время сбора категории появилась блокировка Ozon (fab_). "
+                    "Останавливаем без повторных запросов."
                 )
+                break
 
             cards = self._extract_product_cards(page, settings.browser_mode)
             new_cards = [c for c in cards if c.get("href") not in processed]
@@ -529,7 +926,7 @@ class OzonParser:
                 empty_rounds = 0
 
             for card in new_cards:
-                if self.is_stopped() or len(results) >= settings.max_products:
+                if self.is_stopped() or len(results) >= hard_cap:
                     break
                 href = card.get("href", "")
                 if href:
@@ -538,6 +935,12 @@ class OzonParser:
                 if product:
                     results.append(product)
                     self.on_progress(f"Найдено: {len(results)} — {product.name[:50]}")
+                    if (
+                        on_progress_save
+                        and len(results) - last_saved_count >= CHECKPOINT_SAVE_EVERY_PRODUCTS
+                    ):
+                        on_progress_save(results)
+                        last_saved_count = len(results)
                     if target and self._parse_timer_ref:
                         section, cat, name = self._target_labels(target)
                         self._emit_status(
@@ -551,12 +954,34 @@ class OzonParser:
                         )
                 human_click_delay()
 
-            if not self._scroll_for_more(page):
+            if len(results) >= hard_cap:
+                capped = True
                 break
+            if empty_rounds >= 4:
+                exhausted = True
+                break
+            if not self._scroll_for_more(page):
+                exhausted = True
+                break
+            scroll_rounds += 1
+            if scroll_rounds % SAFE_SCROLL_BATCH_SIZE == 0:
+                if not self._protective_pause(
+                    SAFE_SCROLL_BREAK_MIN,
+                    SAFE_SCROLL_BREAK_MAX,
+                    "Защитная пауза при прокрутке каталога",
+                ):
+                    break
             human_scroll_delay()
 
-        page_loaded = bool(processed) or bool(results) or not is_blocked_page(page)
-        return results, page_loaded
+        access_blocked = is_blocked_page(page) or is_captcha_page(page)
+        # Cap means "pause and resume later"; only mark category done when exhausted.
+        category_completed = (
+            exhausted
+            and not access_blocked
+            and not self.is_stopped()
+            and not capped
+        )
+        return results, category_completed
 
     def _extract_product_cards(
         self,
@@ -655,7 +1080,16 @@ class OzonParser:
         bonus = detail.get("bonus_points")
         card_has_bonus = self._card_has_bonus(card)
 
-        if not name or price_disc is None or (card_has_bonus and bonus is None):
+        # Keep only products that advertise review bonus points on the listing.
+        if not card_has_bonus and not (isinstance(bonus, int) and bonus > 0):
+            return None
+
+        # Bulk-safe mode: never open product pages. Missing fields are skipped.
+        if (
+            (not name or price_disc is None or bonus is None or bonus <= 0)
+            and MAX_PRODUCT_DETAIL_FETCHES > 0
+            and state.detail_fetches < MAX_PRODUCT_DETAIL_FETCHES
+        ):
             full = self._fetch_product_detail(
                 href,
                 state,
@@ -665,14 +1099,14 @@ class OzonParser:
                 name = name or full.get("name")
                 price_disc = price_disc if price_disc is not None else full.get("price_discounted")
                 price_orig = price_orig if price_orig is not None else full.get("price_original")
-                bonus = bonus if bonus is not None else full.get("bonus_points")
+                bonus = bonus if bonus is not None and bonus > 0 else full.get("bonus_points")
 
         if not name or price_disc is None:
             return None
+        if not isinstance(bonus, int) or bonus <= 0:
+            return None
         if price_orig is None or price_orig < price_disc:
             price_orig = price_disc
-        if bonus is None:
-            bonus = 0
         if settings.min_price is not None and price_disc < settings.min_price:
             return None
         if settings.max_price is not None and price_disc > settings.max_price:
@@ -729,7 +1163,7 @@ class OzonParser:
     ) -> dict | None:
         assert self._page is not None
         detail_page = None
-        url = to_browser_url(href, browser_mode)
+        url = self._route_url(href, browser_mode)
         try:
             detail_page = self._page.context.new_page()
             human_delay(1.0, 2.0)

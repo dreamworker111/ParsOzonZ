@@ -26,6 +26,8 @@ except ModuleNotFoundError:
 
 from ozon_parser import auth, browser
 from ozon_parser.config import (
+    BLOCK_COOLDOWN_MAX,
+    BLOCK_COOLDOWN_MIN,
     DESKTOP_USER_AGENT,
     DESKTOP_VIEWPORT,
     MOBILE_MODE,
@@ -53,9 +55,10 @@ class BrowserModeTests(unittest.TestCase):
         self.assertTrue(options["has_touch"])
         self.assertGreater(options["device_scale_factor"], 1)
 
-    @patch("ozon_parser.browser.create_browser_context")
-    def test_mobile_guest_ignores_cookies_and_cdp(self, create_context):
-        create_context.return_value = ("browser", "context", "page")
+    @patch("ozon_parser.browser.prepare_mobile_guest_session", return_value=True)
+    @patch("ozon_parser.browser.open_mobile_guest_session")
+    def test_mobile_guest_ignores_cookies_and_cdp(self, open_guest, _prepare):
+        open_guest.return_value = (None, "context", "page", "mobile_guest_chrome")
         playwright = object()
 
         result = browser.open_session_context(
@@ -67,13 +70,8 @@ class BrowserModeTests(unittest.TestCase):
             use_auth=False,
         )
 
-        self.assertEqual(result, ("browser", "context", "page", "mobile_guest"))
-        create_context.assert_called_once_with(
-            playwright,
-            True,
-            storage_state=None,
-            browser_mode=MOBILE_MODE,
-        )
+        self.assertEqual(result, (None, "context", "page", "mobile_guest_chrome"))
+        open_guest.assert_called_once_with(playwright, True, unittest.mock.ANY)
 
     @patch("ozon_parser.browser.create_persistent_context")
     @patch("ozon_parser.browser.has_mobile_saved_session", return_value=False)
@@ -146,6 +144,25 @@ class BrowserModeTests(unittest.TestCase):
         ]
         self.assertFalse(browser.mobile_context_is_authenticated(context))
 
+    def test_fab_chlg_page_is_detected_as_blocked(self):
+        page = Mock()
+        page.url = "https://m.ozon.ru/"
+        page.evaluate.return_value = "Ozon ограничил доступ. Инцидент: fab_chlg_20260801205943_test"
+
+        self.assertTrue(browser.is_blocked_page(page))
+        self.assertEqual(
+            browser.extract_incident_id(page),
+            "fab_chlg_20260801205943_test",
+        )
+
+    def test_antibot_challenge_page_is_detected(self):
+        page = Mock()
+        page.url = "https://m.ozon.ru/?__rr=1"
+        page.title.return_value = "Antibot Challenge Page"
+        page.evaluate.return_value = "<html><link href='abt-challenge/styles.css'></html>"
+
+        self.assertTrue(browser.is_antibot_challenge_page(page))
+
     def test_blocked_navigation_waits_for_manual_confirmation(self):
         page = Mock()
         page.url = "https://m.ozon.ru/"
@@ -162,6 +179,76 @@ class BrowserModeTests(unittest.TestCase):
 
         self.assertFalse(result)
         confirmation.assert_called_once_with(None)
+        page.reload.assert_not_called()
+
+    def test_safe_goto_waits_out_antibot_before_success(self):
+        page = Mock()
+        page.url = "https://www.ozon.ru/category/?__rr=1"
+        page.title.return_value = "Antibot Challenge Page"
+        page.evaluate.side_effect = [
+            "<html>abt-challenge</html>",
+            "",
+            "",
+        ]
+
+        with patch("ozon_parser.browser.human_delay"), patch(
+            "ozon_parser.browser.wait_for_ozon_ready",
+            return_value=False,
+        ):
+            result = browser.safe_goto(
+                page,
+                "https://www.ozon.ru/category/",
+                max_retries=1,
+            )
+
+        self.assertFalse(result)
+
+    def test_ensure_ready_does_not_reload_fab_page(self):
+        page = Mock()
+        page.url = "https://www.ozon.ru/seller/"
+        page.title.return_value = "Похоже, нет соединения"
+        page.evaluate.return_value = (
+            "Похоже, нет соединения\nИнцидент: fab_20260802064211_TEST"
+        )
+
+        with patch("ozon_parser.browser.human_delay"), patch(
+            "ozon_parser.browser.recover_access",
+            return_value=False,
+        ) as recover:
+            result = browser.ensure_ozon_session_ready(page, warmup_url=page.url)
+
+        self.assertFalse(result)
+        page.goto.assert_not_called()
+        recover.assert_called_once()
+
+    def test_recovery_uses_cooldown_without_automatic_retry(self):
+        page = Mock()
+        page.url = "https://www.ozon.ru/seller/"
+        page.title.return_value = "Ozon"
+        page.evaluate.side_effect = [
+            "",
+            "Подтвердите, что вы не робот",
+            "",
+            "",
+        ]
+        confirmation = Mock(return_value=True)
+
+        with patch("ozon_parser.browser.human_delay") as delay, patch(
+            "ozon_parser.browser.wait_for_ozon_ready",
+            return_value=True,
+        ), patch(
+            "ozon_parser.browser.is_access_restricted",
+            side_effect=[True, False, False],
+        ):
+            result = browser.recover_access(
+                page,
+                on_manual_bypass=confirmation,
+                target_url="https://www.ozon.ru/seller/",
+            )
+
+        self.assertTrue(result)
+        delay.assert_any_call(BLOCK_COOLDOWN_MIN, BLOCK_COOLDOWN_MAX)
+        page.goto.assert_not_called()
         page.reload.assert_not_called()
 
 

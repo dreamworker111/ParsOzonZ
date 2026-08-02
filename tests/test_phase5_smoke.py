@@ -6,17 +6,31 @@ from unittest.mock import Mock, patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from openpyxl import load_workbook
-from PyQt6.QtCore import Qt
-from PyQt6.QtWidgets import QApplication
+try:
+    from openpyxl import load_workbook
+except ImportError:  # pragma: no cover
+    load_workbook = None
 
-from ozon_parser.app import FilterTreeWidget, MainWindow, scaled_font_size
+try:
+    from PyQt6.QtCore import Qt
+    from PyQt6.QtWidgets import QApplication
+except ImportError as exc:  # pragma: no cover - environment without GUI deps
+    Qt = None
+    QApplication = None
+    _GUI_IMPORT_ERROR = exc
+else:
+    _GUI_IMPORT_ERROR = None
+
 from ozon_parser.config import MOBILE_MODE
 from ozon_parser.export import HEADERS, ProductRow, export_products
 from ozon_parser.filters import FilterOptionNode
 from ozon_parser.login import MobileBrowserLoginSession
 
+if _GUI_IMPORT_ERROR is None:
+    from ozon_parser.app import FilterTreeWidget, MainWindow, scaled_font_size
 
+
+@unittest.skipIf(_GUI_IMPORT_ERROR is not None, f"GUI deps unavailable: {_GUI_IMPORT_ERROR}")
 class GuiModeSmokeTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -60,6 +74,22 @@ class GuiModeSmokeTests(unittest.TestCase):
         )
         self.assertEqual(scaled_font_size(1080), 27)
 
+    def test_help_button_and_instructions_content(self):
+        from ozon_parser.instructions import build_user_instructions
+
+        window = MainWindow()
+        self.app.processEvents()
+        try:
+            self.assertEqual(window.help_btn.text(), "Инструкция")
+            self.assertTrue(callable(window._show_instructions))
+            text = build_user_instructions().lower()
+            self.assertIn("открыть chrome", text)
+            self.assertIn("загрузить категории", text)
+            self.assertIn("parse_checkpoint", text)
+            self.assertIn("большой объём", text)
+        finally:
+            window.close()
+
     def test_category_can_be_renamed_without_changing_ozon_target(self):
         tree = FilterTreeWidget()
         child = FilterOptionNode(
@@ -92,6 +122,7 @@ class GuiModeSmokeTests(unittest.TestCase):
             self.assertFalse(window.specific_seller_checkbox.isChecked())
             self.assertFalse(window.seller_input.isEnabled())
             self.assertEqual(window.seller_input.text(), "")
+            self.assertEqual(window.max_products.maximum(), 100000)
 
             window.specific_seller_checkbox.setChecked(True)
             self.app.processEvents()
@@ -104,6 +135,57 @@ class GuiModeSmokeTests(unittest.TestCase):
             self.assertIn("всех продавцов", window.seller_input.placeholderText())
         finally:
             window.close()
+
+
+class BonusOnlyParsingTests(unittest.TestCase):
+    def test_process_card_skips_products_without_bonus(self):
+        from ozon_parser.parser import OzonParser, ParseSettings, _ParseState
+
+        parser = OzonParser()
+        settings = ParseSettings(
+            seller_url="",
+            categories=[],
+            min_price=None,
+            max_price=None,
+            max_products=100,
+            use_auth=False,
+            import_browser_session=False,
+        )
+        state = _ParseState()
+        card = {
+            "href": "https://www.ozon.ru/product/item-1/",
+            "name": "Товар без баллов",
+            "text": "Товар без баллов\n1 000 ₽",
+            "html": "<div>Товар без баллов 1000 ₽</div>",
+        }
+
+        self.assertIsNone(parser._process_card(card, settings, state))
+
+    def test_process_card_keeps_products_with_bonus(self):
+        from ozon_parser.parser import OzonParser, ParseSettings, _ParseState
+
+        parser = OzonParser()
+        settings = ParseSettings(
+            seller_url="",
+            categories=[],
+            min_price=None,
+            max_price=None,
+            max_products=100,
+            use_auth=False,
+            import_browser_session=False,
+        )
+        state = _ParseState()
+        card = {
+            "href": "https://www.ozon.ru/product/item-2/",
+            "name": "Товар с баллами",
+            "text": "Товар с баллами\n1 200 ₽\n150 баллов за отзыв",
+            "html": "<div>150 баллов за отзыв</div>",
+        }
+
+        product = parser._process_card(card, settings, state)
+        self.assertIsNotNone(product)
+        self.assertEqual(product.bonus_points, 150)
+        self.assertEqual(product.name, "Товар с баллами")
 
 
 class MobileLoginFlowTests(unittest.TestCase):
@@ -218,6 +300,7 @@ class MobileLoginFlowTests(unittest.TestCase):
         mark_saved.assert_not_called()
 
 
+@unittest.skipIf(load_workbook is None, "openpyxl unavailable")
 class XlsxRegressionTests(unittest.TestCase):
     def test_export_contains_all_seven_populated_product_fields(self):
         products = [

@@ -13,6 +13,7 @@ from .config import CHROME_OZON_PROFILE, MOBILE_CHROME_PROFILE, SESSION_DIR
 
 BROWSER_PROFILE_DIR = SESSION_DIR / "browser_profile"
 MOBILE_SESSION_MARKER = SESSION_DIR / "mobile_session.json"
+MOBILE_GUEST_PROFILE = SESSION_DIR / "mobile_guest_profile"
 
 
 @dataclass
@@ -44,6 +45,12 @@ def mobile_browser_profile_dir() -> Path:
     """Return the dedicated persistent profile used only by mobile auth."""
     MOBILE_CHROME_PROFILE.mkdir(parents=True, exist_ok=True)
     return MOBILE_CHROME_PROFILE
+
+
+def mobile_guest_profile_dir() -> Path:
+    """Persistent guest profile for mobile mode without authorization."""
+    MOBILE_GUEST_PROFILE.mkdir(parents=True, exist_ok=True)
+    return MOBILE_GUEST_PROFILE
 
 
 def _profile_initialized(profile: Path) -> bool:

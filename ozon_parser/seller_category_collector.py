@@ -12,7 +12,11 @@ from urllib.parse import urlencode, urljoin, urlparse, urlunparse
 from playwright.sync_api import Page
 
 from .browser import recover_access, safe_goto
-from .category_extract import is_valid_category
+from .category_extract import (
+    find_category_node,
+    is_valid_category,
+    parse_composer_response,
+)
 from .config import (
     BrowserMode,
     CATALOG_LOAD_TIMEOUT_SEC,
@@ -62,6 +66,7 @@ class SellerCategoryCollector:
         self.on_manual_bypass = on_manual_bypass
         self.deadline = deadline
         self._root_ids: set[str] = set()
+        self._root_names: set[str] = set()
         self._visited: set[str] = set()
         self._known_ids: set[str] = set()
 
@@ -71,14 +76,14 @@ class SellerCategoryCollector:
         on_roots: Callable[[list[CollectedCategory]], None] | None = None,
         on_branch: Callable[[CollectedCategory], None] | None = None,
     ) -> list[CollectedCategory]:
-        self.log("Открываем страницу магазина...")
+        self.log("Открываем каталог Ozon...")
         if not self._open_page(self.seller_url):
-            raise ConnectionError("Не удалось открыть страницу магазина Ozon.")
+            raise ConnectionError("Не удалось открыть каталог Ozon.")
 
         raw_roots = self._collect_direct_children(parent_id=None, page_url=self.seller_url)
         if not raw_roots:
             raise ConnectionError(
-                "Категории не найдены в данных страницы магазина Ozon."
+                "Категории не найдены в данных страницы каталога Ozon."
             )
 
         roots: list[CollectedCategory] = []
@@ -89,6 +94,7 @@ class SellerCategoryCollector:
             node = self._make_node(item, parent=None)
             roots.append(node)
             self._root_ids.add(node.id)
+            self._root_names.add(self._normalize_name(node.name))
             self._known_ids.add(node.id)
 
         self.log(f"Категории 1-го уровня: {len(roots)}")
@@ -130,9 +136,23 @@ class SellerCategoryCollector:
             return
 
         children: list[CollectedCategory] = []
+        ancestor_names = {
+            self._normalize_name(part)
+            for part in node.path.split(" > ")
+            if part.strip()
+        }
         for item in raw_children:
             cid = str(item.get("id", ""))
-            if not cid or cid == node.id or cid in self._known_ids:
+            name_key = self._normalize_name(str(item.get("name", "")))
+            if (
+                not cid
+                or cid == node.id
+                or cid in self._known_ids
+                or cid in self._root_ids
+                or not name_key
+                or name_key in ancestor_names
+                or name_key in self._root_names
+            ):
                 continue
             child = self._make_node(item, parent=node)
             children.append(child)
@@ -157,6 +177,20 @@ class SellerCategoryCollector:
         if not composer:
             return []
         raw = self._extract_category_filter_children(composer, parent_id)
+        if parent_id is not None and not raw:
+            # Some layouts expose a nested category tree outside categoryFilter.
+            # Use it only when a direct parent-child relation can be established.
+            tree = parse_composer_response(composer)
+            parent = find_category_node(tree, str(parent_id))
+            if parent:
+                raw = [
+                    {
+                        "id": str(child.get("id", "")),
+                        "name": str(child.get("name", "")),
+                        "url": child.get("url"),
+                    }
+                    for child in parent.get("children") or []
+                ]
         return self._filter_fake(raw)
 
     def _extract_category_filter_children(
@@ -170,7 +204,7 @@ class SellerCategoryCollector:
         Ozon сам отдаёт плоский список с полем level:
         родитель (level=N), затем его прямые дети (level=N+1).
         """
-        raw_categories: list[dict] = []
+        category_lists: list[list[dict]] = []
         widget_states = composer.get("widgetStates") or {}
 
         widget_prefixes = (
@@ -196,8 +230,51 @@ class SellerCategoryCollector:
                     ):
                         continue
                     category_filter = filter_item.get("categoryFilter") or {}
-                    raw_categories.extend(category_filter.get("categories") or [])
+                    raw_list = category_filter.get("categories") or []
+                    items = self._normalize_filter_sequence(raw_list)
+                    if items:
+                        category_lists.append(items)
 
+        if not category_lists:
+            return []
+
+        if parent_id is None:
+            roots: list[dict] = []
+            seen_roots: set[str] = set()
+            for items in category_lists:
+                root_level = min(item["level"] for item in items)
+                for item in items:
+                    if item["level"] != root_level or item["id"] in seen_roots:
+                        continue
+                    seen_roots.add(item["id"])
+                    roots.append(item)
+            return roots
+
+        parent_id = str(parent_id)
+        children: list[dict] = []
+        seen_children: set[str] = set()
+        for items in category_lists:
+            parent_index = next(
+                (index for index, item in enumerate(items) if item["id"] == parent_id),
+                -1,
+            )
+            if parent_index < 0:
+                continue
+            parent_level = items[parent_index]["level"]
+            for item in items[parent_index + 1 :]:
+                if item["level"] <= parent_level:
+                    break
+                if (
+                    item["level"] == parent_level + 1
+                    and item["id"] not in seen_children
+                ):
+                    seen_children.add(item["id"])
+                    children.append(item)
+        # Never infer children from unrelated minimum-level categories. That
+        # was the source of duplicated roots under every processed branch.
+        return children
+
+    def _normalize_filter_sequence(self, raw_categories: list[dict]) -> list[dict]:
         items: list[dict] = []
         seen: set[str] = set()
         for raw in raw_categories:
@@ -221,41 +298,11 @@ class SellerCategoryCollector:
                     "level": level,
                 }
             )
+        return items
 
-        if not items:
-            return []
-
-        if parent_id is None:
-            root_level = min(item["level"] for item in items)
-            return [item for item in items if item["level"] == root_level]
-
-        parent_id = str(parent_id)
-        parent_index = next(
-            (index for index, item in enumerate(items) if item["id"] == parent_id),
-            -1,
-        )
-        if parent_index >= 0:
-            parent_level = items[parent_index]["level"]
-            children: list[dict] = []
-            for item in items[parent_index + 1 :]:
-                if item["level"] <= parent_level:
-                    break
-                if item["level"] == parent_level + 1:
-                    children.append(item)
-            return children
-
-        # После редиректа родитель иногда отсутствует, но дети остаются в списке.
-        candidates = [
-            item
-            for item in items
-            if item["id"] != parent_id
-            and item["id"] not in self._root_ids
-            and item["id"] not in self._known_ids
-        ]
-        if not candidates:
-            return []
-        child_level = min(item["level"] for item in candidates)
-        return [item for item in candidates if item["level"] == child_level]
+    @staticmethod
+    def _normalize_name(name: str) -> str:
+        return re.sub(r"\s+", " ", name.strip().lower().replace("ё", "е"))
 
     @staticmethod
     def _category_id_from_filter_item(raw: dict, href: str) -> str | None:
@@ -366,7 +413,8 @@ class SellerCategoryCollector:
     def _resolve_url(self, href: str | None, category_id: str) -> str:
         if href:
             absolute = to_browser_url(urljoin(self.seller_url, href), self.browser_mode)
-            if "category" in absolute and "/seller/" in absolute:
+            lower = absolute.lower()
+            if "category" in lower and "ozon.ru" in lower:
                 return absolute
         return self._build_category_url(category_id)
 
@@ -395,12 +443,16 @@ def collect_seller_categories(
     seller_url: str,
     log: Callable[[str], None] | None = None,
     on_manual_bypass=None,
-    timeout_sec: int = CATALOG_LOAD_TIMEOUT_SEC,
+    timeout_sec: int | None = CATALOG_LOAD_TIMEOUT_SEC,
     on_roots: Callable[[list[CollectedCategory]], None] | None = None,
     on_branch: Callable[[CollectedCategory], None] | None = None,
     browser_mode: BrowserMode = DESKTOP_MODE,
 ) -> list[CollectedCategory]:
-    deadline = time.monotonic() + max(60, timeout_sec)
+    deadline = (
+        time.monotonic() + max(60, timeout_sec)
+        if timeout_sec is not None
+        else None
+    )
     collector = SellerCategoryCollector(
         page,
         seller_url,

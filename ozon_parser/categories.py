@@ -6,7 +6,17 @@ from urllib.parse import parse_qs, urlencode, urljoin, urlparse, urlunparse
 
 from playwright.sync_api import Page
 
-from .browser import is_seller_page, recover_access, safe_goto
+from .browser import (
+    extract_incident_id,
+    is_access_restricted,
+    is_antibot_challenge_page,
+    is_blocked_page,
+    is_captcha_page,
+    is_seller_page,
+    recover_access,
+    safe_goto,
+    wait_for_ozon_ready,
+)
 from .category_extract import (
     find_category_nodes,
     is_valid_category,
@@ -27,6 +37,7 @@ from .utils import (
     fast_delay,
     human_delay,
     normalize_seller_url,
+    route_browser_url,
     to_browser_url,
 )
 
@@ -37,10 +48,16 @@ from .config import (
     DESKTOP_BASE_URL,
     DESKTOP_MODE,
     GLOBAL_CATALOG_PATH,
+    GLOBAL_COMPOSER_BATCH_SIZE,
     MOBILE_BASE_URL,
+    MOBILE_DESKTOP_HOST_SESSIONS,
     MOBILE_MODE,
 )
-from .seller_category_collector import collect_seller_categories, collected_to_filter_dict
+from .seller_category_collector import (
+    SellerCategoryCollector,
+    collect_seller_categories,
+    collected_to_filter_dict,
+)
 
 # Блок категорий в фильтре Ozon (CSS-modules класс)
 CATEGORY_BLOCK_CLASS = "wb6_7"
@@ -329,18 +346,28 @@ class CategoryNode:
 
 class CategoryLoader:
     MAX_SUBCATEGORY_DEPTH = 15
-    SUBTREE_API_BATCH_SIZE = 8
+    SUBTREE_API_BATCH_SIZE = GLOBAL_COMPOSER_BATCH_SIZE
 
     def __init__(
         self,
         page: Page,
         browser_mode: BrowserMode = DESKTOP_MODE,
+        session_mode: str | None = None,
     ):
         self.page = page
         self.browser_mode = browser_mode
+        self.session_mode = session_mode
+
+    def _catalog_base_url(self) -> str:
+        if (
+            self.browser_mode == MOBILE_MODE
+            and self.session_mode not in MOBILE_DESKTOP_HOST_SESSIONS
+        ):
+            return MOBILE_BASE_URL
+        return DESKTOP_BASE_URL
 
     def _route_url(self, url: str) -> str:
-        return to_browser_url(url, self.browser_mode)
+        return route_browser_url(url, self.browser_mode, self.session_mode)
 
     def load_root_categories(
         self,
@@ -355,7 +382,10 @@ class CategoryLoader:
             log("Открываем страницу магазина...")
             if not safe_goto(self.page, url, log, on_manual_bypass=on_manual_bypass):
                 if not recover_access(self.page, log, on_manual_bypass, target_url=url):
-                    raise ConnectionError("Ozon заблокировал доступ. Обновите Chrome (F5) и повторите.")
+                    raise ConnectionError(
+                        "Ozon заблокировал доступ. Подождите 15–30 минут, "
+                        "откройте Chrome один раз и повторите."
+                    )
                 if not safe_goto(self.page, url, log, on_manual_bypass=on_manual_bypass):
                     raise ConnectionError("Не удалось открыть страницу магазина.")
         else:
@@ -444,69 +474,167 @@ class CategoryLoader:
         progress: Callable[[str], None] | None = None,
         on_manual_bypass=None,
         on_roots: Callable[[list[FilterOptionNode]], None] | None = None,
+        on_subcategories_begin: Callable[[int], None] | None = None,
         on_branch: Callable[[FilterOptionNode], None] | None = None,
+        timeout_sec: int | None = None,
     ) -> list[FilterOptionNode]:
-        """Load Ozon's general catalogue, without restricting it to a seller."""
+        """Load the full Ozon catalogue tree for all sellers, with all branches."""
         log = progress or (lambda _m: None)
-        base = MOBILE_BASE_URL if self.browser_mode == MOBILE_MODE else DESKTOP_BASE_URL
-        candidates = (
-            base.rstrip("/") + ALL_SELLERS_PATH,
-            base.rstrip("/") + GLOBAL_CATALOG_PATH,
-            base.rstrip("/") + "/",
-        )
+        base = self._catalog_base_url()
+        catalog_base = base.rstrip("/") + ALL_SELLERS_PATH
 
-        categories: list[dict] = []
-        for url in candidates:
-            log("Открываем общий каталог Ozon...")
-            if not safe_goto(
-                self.page,
-                url,
+        def emit_roots(roots) -> None:
+            self._seller_root_ids = {r.id for r in roots}
+            if not on_roots:
+                return
+            stubs: list[FilterOptionNode] = []
+            for root in roots:
+                data = collected_to_filter_dict(root)
+                data["children"] = []
+                if node := self._dict_to_option_tree(data, parent_name=""):
+                    stubs.append(node)
+            if stubs:
+                on_roots(stubs)
+
+        def emit_branch(root) -> None:
+            if not on_branch:
+                return
+            if node := self._dict_to_option_tree(collected_to_filter_dict(root), parent_name=""):
+                on_branch(node)
+
+        def roots_loaded(roots) -> None:
+            emit_roots(roots)
+            if on_subcategories_begin and roots:
+                on_subcategories_begin(len(roots))
+
+        log("Сбор полного каталога Ozon (все продавцы, все ветки)...")
+        try:
+            raw_roots = self._load_global_root_categories(log, on_manual_bypass)
+            if not raw_roots:
+                raise self._global_catalog_access_error(
+                    "Общий каталог не вернул корневые категории."
+                )
+
+            self._seller_root_ids = {str(root["id"]) for root in raw_roots}
+            if on_roots:
+                stubs = [
+                    node
+                    for raw in raw_roots
+                    if (
+                        node := self._dict_to_option_tree(
+                            {**raw, "children": []},
+                            parent_name="",
+                        )
+                    )
+                ]
+                if stubs:
+                    on_roots(stubs)
+            if on_subcategories_begin:
+                on_subcategories_begin(len(raw_roots))
+
+            # Composer tree API needs real /category/{id}/ pages to return children.
+            # Browser navigation still prefers /seller/ (see _load_global_root_categories).
+            category_base = base.rstrip("/") + GLOBAL_CATALOG_PATH
+            root_ids = [str(root["id"]) for root in raw_roots]
+            root_children = self._fetch_categories_batch(
+                category_base,
+                root_ids,
                 log,
-                on_manual_bypass=on_manual_bypass,
-            ):
-                continue
-            categories = self._collect_root_categories(log)
-            if categories:
-                break
+            )
+            deadline = (
+                time.monotonic() + max(60, timeout_sec)
+                if timeout_sec is not None
+                else None
+            )
+            for index, root in enumerate(raw_roots, start=1):
+                if deadline is not None and self._past_deadline(deadline):
+                    log(
+                        f"Лимит времени: обработано {index - 1}/{len(raw_roots)} веток"
+                    )
+                    break
+                root_id = str(root["id"])
+                log(f"Ветка {index}/{len(raw_roots)}: {root['name']}")
+                root["children"] = root_children.get(root_id) or []
+                self._complete_category_subtree(
+                    category_base,
+                    root["children"],
+                    log,
+                    deadline,
+                )
+                if on_branch:
+                    if node := self._dict_to_option_tree(root, parent_name=""):
+                        on_branch(node)
 
-        if not categories:
-            # The homepage/catalog shell may omit category widgets for some
-            # sessions. Reuse the dedicated Composer collector as a fallback.
+            result = [
+                node
+                for raw in raw_roots
+                if (node := self._dict_to_option_tree(raw, parent_name=""))
+            ]
+            if not result:
+                raise ConnectionError("Полный каталог Ozon не распознан.")
+            subtotal = sum(self._count_option_descendants(node) for node in result)
+            log(
+                f"Готово: полный каталог Ozon — {len(result)} корневых разделов, "
+                f"всего узлов: {subtotal}"
+            )
+            return result
+        except Exception as primary_exc:
+            if self._page_access_blocked():
+                raise self._global_catalog_access_error(str(primary_exc)) from primary_exc
+            log(f"Основной сбор каталога не удался: {primary_exc}")
+            log("Пробуем резервную загрузку Composer API...")
             try:
                 from ozon_categories.collector import OzonCategoryCollector
 
-                source_url = base.rstrip("/") + ALL_SELLERS_PATH
-                log("Основной источник не вернул категории — пробуем Composer API...")
                 with OzonCategoryCollector(
-                    source_url,
+                    catalog_base,
                     playwright_page=self.page,
                 ) as collector:
-                    categories = [
-                        node.to_dict()
-                        for node in collector.load_categories(force=True)
+                    collected_dicts = [
+                        node.to_dict() for node in collector.load_categories(force=True)
                     ]
-            except Exception as exc:
-                log(f"Резервная загрузка общего каталога: {exc}")
+            except Exception as fallback_exc:
+                if self._page_access_blocked():
+                    raise self._global_catalog_access_error(str(primary_exc)) from fallback_exc
+                raise ConnectionError(
+                    "Не удалось загрузить полный каталог Ozon. "
+                    f"Основная ошибка: {primary_exc}. Резерв: {fallback_exc}"
+                ) from fallback_exc
 
-        result = [
-            node
-            for raw in categories
-            if (node := self._dict_to_option_tree(raw, parent_name=""))
-        ]
-        if not result:
-            raise ConnectionError(
-                "Не удалось загрузить общий каталог Ozon. "
-                "Обновите открытое окно браузера и повторите."
+            if on_roots:
+                stubs = [
+                    node
+                    for raw in collected_dicts
+                    if (
+                        node := self._dict_to_option_tree(
+                            {**raw, "children": []},
+                            parent_name="",
+                        )
+                    )
+                ]
+                if stubs:
+                    on_roots(stubs)
+                    if on_subcategories_begin:
+                        on_subcategories_begin(len(stubs))
+
+            result = [
+                node
+                for raw in collected_dicts
+                if (node := self._dict_to_option_tree(raw, parent_name=""))
+            ]
+            if on_branch:
+                for node in result:
+                    on_branch(node)
+            if not result:
+                raise ConnectionError(str(primary_exc)) from primary_exc
+
+            self._seller_root_ids = {node.id for node in result}
+            subtotal = sum(self._count_option_descendants(node) for node in result)
+            log(
+                f"Общий каталог загружен через Composer API: "
+                f"{len(result)} разделов, всего узлов: {subtotal}"
             )
-
-        self._seller_root_ids = {node.id for node in result}
-        if on_roots:
-            on_roots(result)
-        if on_branch:
-            for node in result:
-                on_branch(node)
-        log(f"Загружен общий каталог Ozon: {len(result)} разделов")
-        return result
+            return result
 
     def _collect_category_branch_whole(
         self,
@@ -714,6 +842,10 @@ class CategoryLoader:
         }
         """
         result: dict[str, list[dict]] = {cid: [] for cid in category_ids}
+        if is_antibot_challenge_page(self.page):
+            log("Ozon проверяет браузер перед пакетным запросом категорий...")
+            if not wait_for_ozon_ready(self.page, log):
+                return result
         try:
             payload_items = [{"path": p, "fullUrl": u} for p, u in url_pairs]
             client_name = "mweb_client" if self.browser_mode == MOBILE_MODE else "dweb_client"
@@ -724,9 +856,23 @@ class CategoryLoader:
             if not raw:
                 return result
             payload = json.loads(raw)
+            filter_parser = SellerCategoryCollector(
+                self.page,
+                self._catalog_base_url().rstrip("/") + ALL_SELLERS_PATH,
+                browser_mode=self.browser_mode,
+            )
+            filter_parser._root_ids = set(getattr(self, "_seller_root_ids", set()))
             for cid, (path, _full) in zip(category_ids, url_pairs):
                 data = payload.get(path)
                 if not data:
+                    continue
+                direct = filter_parser._extract_category_filter_children(data, cid)
+                if direct:
+                    result[cid] = self._clone_category_branch(
+                        direct,
+                        cid,
+                        seller_base,
+                    )
                     continue
                 subcats = self._cleanup_categories(parse_composer_response(data))
                 parent_node = self._find_category_node(subcats, cid)
@@ -800,40 +946,8 @@ class CategoryLoader:
             if nested:
                 return nested
 
-        page_category = page_category_id or self._page_category_id()
-        if page_category == parent_id:
-            flat = self._collect_flat_categories(subcats)
-            seen: set[str] = set()
-            candidates: list[dict] = []
-            for item in flat:
-                cid = str(item.get("id", ""))
-                if not cid or cid == parent_id or cid in seen:
-                    continue
-                if not is_valid_category(str(item.get("name", "")), cid):
-                    continue
-                if cid in root_ids:
-                    continue
-                seen.add(cid)
-                candidates.append(item)
-            if candidates:
-                return self._sanitize_child_dicts(candidates, parent_id)
-
-        flat = self._collect_flat_categories(subcats)
-        candidates: list[dict] = []
-        seen: set[str] = set()
-        for item in flat:
-            cid = str(item.get("id", ""))
-            if not cid or cid == parent_id or cid in seen:
-                continue
-            if not is_valid_category(str(item.get("name", "")), cid):
-                continue
-            if parent_id in root_ids and cid in root_ids:
-                continue
-            seen.add(cid)
-            candidates.append(item)
-        if candidates:
-            return self._sanitize_child_dicts(candidates, parent_id)
-
+        # Parent absent => relationship is unproven. Never copy unrelated
+        # categories into this branch.
         return []
 
     def _page_category_id(self) -> str | None:
@@ -1036,25 +1150,7 @@ class CategoryLoader:
             if cloned:
                 return cloned
 
-        page_category = parent_id
-        flat = self._collect_flat_categories(merged)
-        root_ids = getattr(self, "_seller_root_ids", set())
-        candidates = [
-            item
-            for item in flat
-            if str(item.get("id")) != parent_id and str(item.get("id")) not in root_ids
-        ]
-        if not candidates:
-            candidates = [item for item in flat if str(item.get("id")) != parent_id]
-        if candidates and page_category == parent_id:
-            child_ids: set[str] = set()
-            for item in candidates:
-                for nested in self._collect_flat_categories(item.get("children") or []):
-                    child_ids.add(str(nested.get("id")))
-            top_level = [item for item in candidates if str(item.get("id")) not in child_ids]
-            if top_level:
-                return self._clone_category_branch(top_level, parent_id, seller_base)
-
+        # Without the parent node there is no proven hierarchy.
         return []
 
     def _clean_category_dicts_recursive(self, raw: list[dict]) -> list[dict]:
@@ -1267,12 +1363,148 @@ class CategoryLoader:
         return [FilterSection(title="Категория", options=tree)]
 
     def _build_category_url(self, seller_base: str, category_id: str) -> str:
+        """Build URL for a category node.
+
+        - Seller shops: /seller/...?category=ID (filter on shop page)
+        - Global tree Composer API: /category/ID/ (returns subcategory hierarchy)
+        """
         parsed = urlparse(seller_base)
-        if "/seller/" not in parsed.path.lower():
-            path = f"/category/{category_id}/"
-            return urlunparse((parsed.scheme, parsed.netloc, path, "", "", ""))
-        query = urlencode({"category": category_id})
-        return urlunparse((parsed.scheme, parsed.netloc, parsed.path, "", query, ""))
+        scheme = parsed.scheme or "https"
+        host = parsed.netloc or urlparse(self._catalog_base_url()).netloc
+        path_lower = (parsed.path or "").lower()
+        if "/seller/" in path_lower:
+            path = parsed.path if parsed.path.endswith("/") else parsed.path + "/"
+            query = urlencode({"category": category_id})
+            return urlunparse((scheme, host, path, "", query, ""))
+        # Global catalogue Composer endpoint — required for subcategory trees.
+        path = f"{GLOBAL_CATALOG_PATH.rstrip('/')}/{category_id}/"
+        return urlunparse((scheme, host, path, "", "", ""))
+
+    def _page_access_blocked(self) -> bool:
+        try:
+            return is_access_restricted(self.page)
+        except Exception:
+            return False
+
+    def _ensure_page_ready_for_catalog(self, log, on_manual_bypass) -> bool:
+        if wait_for_ozon_ready(self.page, log):
+            return True
+        if is_antibot_challenge_page(self.page):
+            log("Ozon проверяет браузер перед загрузкой каталога...")
+            return recover_access(
+                self.page,
+                log,
+                on_manual_bypass,
+            ) and wait_for_ozon_ready(self.page, log)
+        return False
+
+    def _global_catalog_access_error(self, detail: str = "") -> ConnectionError:
+        incident = ""
+        try:
+            incident = extract_incident_id(self.page) or ""
+        except Exception:
+            incident = ""
+        blocked = self._page_access_blocked()
+        parts = []
+        if blocked:
+            parts.append(
+                "Ozon временно ограничил доступ к каталогу "
+                "(проверка браузера, блокировка или captcha)."
+            )
+            if incident:
+                parts.append(f"Инцидент: {incident}")
+            parts.append(
+                "Подождите 15–30 минут, обновите страницу в Chrome один раз, "
+                "пройдите проверку при необходимости, затем снова нажмите "
+                "«Загрузить категории»."
+            )
+        else:
+            parts.append(detail or "Общий каталог не вернул корневые категории.")
+            parts.append(
+                "Откройте Chrome для Ozon, убедитесь что сайт загружается, "
+                "затем повторите загрузку категорий."
+            )
+        return ConnectionError("\n".join(parts))
+
+    def _load_global_root_categories(self, log, on_manual_bypass) -> list[dict]:
+        """Try several catalog entry points until root categories appear."""
+        base = self._catalog_base_url()
+        # Prefer /seller/ first — /category/ triggers fab_ more often.
+        candidates = [
+            base.rstrip("/") + ALL_SELLERS_PATH,
+            base.rstrip("/") + "/",
+            base.rstrip("/") + GLOBAL_CATALOG_PATH,
+        ]
+
+        if self._page_access_blocked():
+            log("Обнаружена блокировка Ozon перед загрузкой каталога...")
+            if not recover_access(
+                self.page,
+                log,
+                on_manual_bypass,
+                candidates[0],
+            ):
+                return []
+            if not self._ensure_page_ready_for_catalog(log, on_manual_bypass):
+                return []
+
+        for source_url in candidates:
+            if self._page_access_blocked():
+                log("Каталог недоступен из‑за блокировки Ozon — остановка без лишних переходов")
+                return []
+
+            log(f"Открываем каталог: {source_url}")
+            if not safe_goto(
+                self.page,
+                source_url,
+                log,
+                on_manual_bypass=on_manual_bypass,
+            ):
+                if self._page_access_blocked():
+                    return []
+                continue
+            if self._page_access_blocked():
+                log("Страница каталога недоступна — Ozon проверяет браузер или заблокировал доступ")
+                if not recover_access(
+                    self.page,
+                    log,
+                    on_manual_bypass,
+                    source_url,
+                ):
+                    return []
+                if not wait_for_ozon_ready(self.page, log):
+                    return []
+
+            roots = self._collect_root_categories(log)
+            if len(roots) < 2 and is_antibot_challenge_page(self.page):
+                log("Корневые категории не найдены — ждём завершения проверки Ozon...")
+                if wait_for_ozon_ready(self.page, log):
+                    roots = self._collect_root_categories(log)
+            if len(roots) >= 2:
+                log(f"Найдено корневых категорий: {len(roots)}")
+                return roots
+
+            # Extra pass via category-filter collector used for seller trees.
+            try:
+                collector = SellerCategoryCollector(
+                    self.page,
+                    source_url,
+                    log=log,
+                    on_manual_bypass=on_manual_bypass,
+                    browser_mode=self.browser_mode,
+                )
+                filter_roots = collector._collect_direct_children(None, source_url)
+                cleaned = self._cleanup_categories(filter_roots)
+                if len(cleaned) >= 2:
+                    log(
+                        f"Корневые категории получены из фильтра каталога: "
+                        f"{len(cleaned)}"
+                    )
+                    return cleaned
+            except Exception as exc:
+                log(f"Фильтр каталога: {exc}")
+
+        return []
 
     def _collect_root_categories(self, log) -> list[dict]:
         from_dom = self._extract_categories_from_dom()

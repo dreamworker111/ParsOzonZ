@@ -58,9 +58,10 @@ def to_desktop_url(url: str) -> str:
 def with_price_sort_asc(
     url: str,
     browser_mode: BrowserMode = DESKTOP_MODE,
+    session_mode: str | None = None,
 ) -> str:
     """Добавляет сортировку «по возрастанию цены» к URL каталога Ozon."""
-    url = to_browser_url(url, browser_mode)
+    url = route_browser_url(url, browser_mode, session_mode)
     parsed = urlparse(url)
     params = dict(parse_qsl(parsed.query, keep_blank_values=True))
     params["sorting"] = "price"
@@ -88,6 +89,19 @@ def to_browser_url(url: str, browser_mode: BrowserMode = DESKTOP_MODE) -> str:
     if browser_mode == MOBILE_MODE:
         return to_mobile_url(url)
     raise ValueError(f"Неизвестный режим браузера: {browser_mode}")
+
+
+def route_browser_url(
+    url: str,
+    browser_mode: BrowserMode = DESKTOP_MODE,
+    session_mode: str | None = None,
+) -> str:
+    """Route URLs for mobile UI sessions that still browse via www.ozon.ru."""
+    from .config import MOBILE_DESKTOP_HOST_SESSIONS, MOBILE_MODE
+
+    if browser_mode == MOBILE_MODE and session_mode in MOBILE_DESKTOP_HOST_SESSIONS:
+        return to_desktop_url(url)
+    return to_browser_url(url, browser_mode)
 
 
 def to_desktop_product_url(url: str) -> str:
@@ -223,8 +237,9 @@ def merge_category_trees(trees: list[list[dict]]) -> list[dict]:
 def normalize_seller_url(
     url: str,
     browser_mode: BrowserMode = DESKTOP_MODE,
+    session_mode: str | None = None,
 ) -> str:
-    routed = to_browser_url(url, browser_mode)
+    routed = route_browser_url(url, browser_mode, session_mode)
     if "/seller/" not in routed:
         raise ValueError("Ссылка должна вести на страницу магазина Ozon (содержать /seller/)")
     return routed.rstrip("/") + "/"

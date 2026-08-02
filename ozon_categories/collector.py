@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from pathlib import Path
 from typing import Any, Protocol
 from urllib.parse import quote
@@ -232,6 +233,7 @@ class OzonCategoryCollector:
         self._roots: list[CategoryNode] = []
         self._index: dict[str, CategoryNode] = {}
         self._root_ids: set[str] = set()
+        self._root_names: set[str] = set()
         self._visited: set[str] = set()
 
         if fetcher is not None:
@@ -380,6 +382,7 @@ class OzonCategoryCollector:
             node = self._make_node(item, parent=None)
             roots.append(node)
             self._root_ids.add(node.id)
+            self._root_names.add(self._normalize_name(node.name))
 
         queue: list[CategoryNode] = list(roots)
         self._visited.clear()
@@ -431,12 +434,24 @@ class OzonCategoryCollector:
         nodes: list[CategoryNode] = []
         for item in raw_children:
             cid = str(item.get("id", ""))
-            if cid == parent_id or cid in {c.id for c in (parent.children if parent else [])}:
+            name_key = self._normalize_name(str(item.get("name", "")))
+            existing = self._index.get(cid)
+            if (
+                cid == parent_id
+                or cid in self._root_ids
+                or name_key in self._root_names
+                or cid in {c.id for c in (parent.children if parent else [])}
+                or (existing is not None and existing.parent_id != parent_id)
+            ):
                 continue
             if not is_valid_category(str(item.get("name", "")), cid):
                 continue
             nodes.append(self._make_node(item, parent=parent))
         return nodes
+
+    @staticmethod
+    def _normalize_name(name: str) -> str:
+        return re.sub(r"\s+", " ", name.strip().lower().replace("ё", "е"))
 
     def _safe_fetch(self, path: str) -> tuple[dict[str, Any] | None, str | None]:
         try:
@@ -493,6 +508,7 @@ class OzonCategoryCollector:
     def _rebuild_index(self) -> None:
         self._index.clear()
         self._root_ids = {r.id for r in self._roots}
+        self._root_names = {self._normalize_name(r.name) for r in self._roots}
 
         def walk(node: CategoryNode) -> None:
             self._index[node.id] = node

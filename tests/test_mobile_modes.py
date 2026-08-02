@@ -3,9 +3,11 @@ import unittest
 from unittest.mock import Mock, patch
 
 from ozon_parser.categories import CategoryLoader, CategoryTarget
+from ozon_parser.category_extract import extract_direct_children as extract_app_children
 from ozon_parser.config import DESKTOP_MODE, MOBILE_MODE
 from ozon_parser.parser import OzonParser, ParseSettings
 from ozon_parser.seller_category_collector import SellerCategoryCollector
+from ozon_categories.parser import extract_direct_children as extract_fallback_children
 from ozon_parser.utils import (
     normalize_seller_url,
     to_browser_url,
@@ -36,6 +38,37 @@ class MobileRoutingTests(unittest.TestCase):
         self.assertEqual(seller, "https://m.ozon.ru/seller/shop-1/")
         self.assertIn("m.ozon.ru", catalog)
         self.assertIn("sorting=price", catalog)
+
+    def test_parsers_never_infer_children_when_parent_is_missing(self):
+        tree = [
+            {"id": "100", "name": "Электроника", "children": []},
+            {
+                "id": "200",
+                "name": "Одежда",
+                "children": [
+                    {"id": "201", "name": "Мужская одежда", "children": []}
+                ],
+            },
+        ]
+
+        self.assertEqual(
+            extract_app_children(
+                tree,
+                "999",
+                root_ids={"100", "200"},
+                page_category_id="999",
+            ),
+            [],
+        )
+        self.assertEqual(
+            extract_fallback_children(
+                tree,
+                "999",
+                root_ids={"100", "200"},
+                page_category_id="999",
+            ),
+            [],
+        )
 
 
 class MobileComposerTests(unittest.TestCase):
@@ -84,6 +117,82 @@ class MobileComposerTests(unittest.TestCase):
 
         self.assertEqual([item["id"] for item in roots], ["100"])
         self.assertEqual([item["id"] for item in children], ["101"])
+
+    def test_missing_parent_does_not_turn_categories_into_children(self):
+        collector = SellerCategoryCollector(
+            Mock(),
+            "https://www.ozon.ru/seller/",
+            browser_mode=DESKTOP_MODE,
+        )
+        collector._root_ids = {"100", "200"}
+        collector._known_ids = {"100", "200"}
+        state = {
+            "sections": [
+                {
+                    "filters": [
+                        {
+                            "type": "categoryFilter",
+                            "key": "category",
+                            "categoryFilter": {
+                                "categories": [
+                                    {
+                                        "title": "Электроника",
+                                        "urlValue": "?category=100",
+                                        "level": 0,
+                                    },
+                                    {
+                                        "title": "Одежда",
+                                        "urlValue": "?category=200",
+                                        "level": 0,
+                                    },
+                                    {
+                                        "title": "Мужская одежда",
+                                        "urlValue": "?category=201",
+                                        "level": 1,
+                                    },
+                                ]
+                            },
+                        }
+                    ]
+                }
+            ]
+        }
+        composer = {"widgetStates": {"filtersDesktop-1": json.dumps(state)}}
+
+        children = collector._extract_category_filter_children(composer, "999")
+
+        self.assertEqual(children, [])
+
+    def test_collector_rejects_root_alias_as_subcategory(self):
+        collector = SellerCategoryCollector(
+            Mock(),
+            "https://www.ozon.ru/seller/",
+            browser_mode=DESKTOP_MODE,
+        )
+        collector._open_page = Mock(return_value=True)
+        root_one = {"id": "100", "name": "Электроника", "url": "?category=100"}
+        root_two = {"id": "200", "name": "Одежда", "url": "?category=200"}
+        responses = {
+            None: [root_one, root_two],
+            "100": [
+                {"id": "999", "name": "Электроника", "url": "?category=999"},
+                {"id": "101", "name": "Смартфоны", "url": "?category=101"},
+            ],
+            "101": [],
+            "200": [],
+        }
+        collector._collect_direct_children = Mock(
+            side_effect=lambda parent_id, page_url: responses.get(parent_id, [])
+        )
+
+        roots = collector.collect()
+
+        self.assertEqual([root.name for root in roots], ["Электроника", "Одежда"])
+        self.assertEqual(
+            [child.name for child in roots[0].children],
+            ["Смартфоны"],
+        )
+        self.assertEqual(roots[1].children, [])
 
     def test_mobile_composer_uses_mobile_host_and_client(self):
         page = Mock()
@@ -157,7 +266,87 @@ class ParserModeTests(unittest.TestCase):
             "https://m.ozon.ru/product/item-1/",
         )
 
-    def test_all_stores_uses_global_category_url(self):
+    @patch("ozon_parser.categories.safe_goto", return_value=True)
+    def test_global_catalog_loader_collects_full_tree(self, _safe_goto):
+        loader = CategoryLoader(Mock(), DESKTOP_MODE)
+        loader._load_global_root_categories = Mock(
+            return_value=[
+                {
+                    "id": "100",
+                    "name": "Электроника",
+                    "url": "/category/elektronika-100/",
+                    "children": [],
+                }
+            ]
+        )
+        loader._fetch_categories_batch = Mock(
+            side_effect=[
+                {
+                    "100": [
+                        {
+                            "id": "101",
+                            "name": "Смартфоны",
+                            "url": "/category/smartfony-101/",
+                            "children": [],
+                        }
+                    ]
+                },
+                {"101": []},
+            ]
+        )
+        roots = loader.load_global_category_tree()
+
+        self.assertEqual(len(roots), 1)
+        self.assertEqual(roots[0].category_id, "100")
+        self.assertEqual(len(roots[0].children), 1)
+        self.assertEqual(roots[0].children[0].category_id, "101")
+        self.assertEqual(loader._fetch_categories_batch.call_count, 2)
+        # Subtree Composer API must use /category/ base to return children.
+        self.assertIn(
+            "/category/",
+            loader._fetch_categories_batch.call_args_list[0].args[0],
+        )
+
+    def test_global_catalog_error_explains_ozon_block(self):
+        page = Mock()
+        page.url = "https://www.ozon.ru/seller/"
+        page.title.return_value = "Похоже, нет соединения"
+        page.evaluate.return_value = (
+            "Похоже, нет соединения\nИнцидент: fab_20260801204409_TEST"
+        )
+        loader = CategoryLoader(page, DESKTOP_MODE)
+        error = loader._global_catalog_access_error("fallback")
+        message = str(error).lower()
+        self.assertTrue(
+            "заблокировал" in message or "ограничил" in message,
+            message,
+        )
+        self.assertIn("инцидент", message)
+        self.assertIn("15–30", message)
+
+    def test_build_category_url_uses_category_path_for_global_tree(self):
+        loader = CategoryLoader(Mock(), DESKTOP_MODE)
+        url = loader._build_category_url("https://www.ozon.ru/category/", "15500")
+        self.assertEqual(url, "https://www.ozon.ru/category/15500/")
+        path, full = loader._composer_urls_for_category(
+            "https://www.ozon.ru/category/",
+            "15500",
+        )
+        self.assertEqual(path, "/category/15500/")
+        self.assertEqual(full, "https://www.ozon.ru/category/15500/")
+
+    def test_build_category_url_uses_seller_filter_for_shop(self):
+        loader = CategoryLoader(Mock(), DESKTOP_MODE)
+        url = loader._build_category_url(
+            "https://www.ozon.ru/seller/shop-1/",
+            "15500",
+        )
+        self.assertEqual(
+            url,
+            "https://www.ozon.ru/seller/shop-1/?category=15500",
+        )
+
+    def test_all_stores_uses_seller_filter_url(self):
         target = CategoryTarget(
             id="123",
             category_id="123",
@@ -171,24 +360,15 @@ class ParserModeTests(unittest.TestCase):
             "https://www.ozon.ru/seller/?category=123&sorting=price",
         )
 
-    @patch("ozon_parser.categories.safe_goto", return_value=True)
-    def test_global_catalog_loader_does_not_require_seller_url(self, _safe_goto):
-        loader = CategoryLoader(Mock(), DESKTOP_MODE)
-        loader._collect_root_categories = Mock(
-            return_value=[
-                {
-                    "id": "123",
-                    "name": "Электроника",
-                    "url": "https://www.ozon.ru/category/elektronika-123/",
-                    "children": [],
-                }
-            ]
+        with_category_path = CategoryTarget(
+            id="15500",
+            category_id="15500",
+            url="https://www.ozon.ru/category/elektronika-15500/",
         )
-
-        roots = loader.load_global_category_tree()
-
-        self.assertEqual([root.category_id for root in roots], ["123"])
-        self.assertNotIn("/seller/", roots[0].url or "")
+        self.assertEqual(
+            OzonParser()._build_global_catalog_url(with_category_path, DESKTOP_MODE),
+            "https://www.ozon.ru/seller/?category=15500&sorting=price",
+        )
 
 
 if __name__ == "__main__":
