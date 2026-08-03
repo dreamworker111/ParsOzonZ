@@ -357,7 +357,7 @@ class ParserModeTests(unittest.TestCase):
 
         self.assertEqual(
             url,
-            "https://www.ozon.ru/seller/?category=123&sorting=price",
+            "https://www.ozon.ru/seller/0/?category=123&sorting=price",
         )
 
         with_category_path = CategoryTarget(
@@ -367,7 +367,7 @@ class ParserModeTests(unittest.TestCase):
         )
         self.assertEqual(
             OzonParser()._build_global_catalog_url(with_category_path, DESKTOP_MODE),
-            "https://www.ozon.ru/seller/?category=15500&sorting=price",
+            "https://www.ozon.ru/seller/0/?category=15500&sorting=price",
         )
 
 

@@ -343,6 +343,19 @@ def build_stylesheet(
                 font-size: {max(13, fs - 8)}px;
                 font-weight: 300;
             }}
+            QLabel#SelectedCategoryCount {{
+                color: {c.text};
+                font-size: {max(13, fs - 7)}px;
+                font-weight: 500;
+                padding: 4px 8px;
+                min-width: 96px;
+            }}
+            QLabel#ChromeModeHint {{
+                color: {c.text_muted};
+                font-size: {max(13, fs - 7)}px;
+                font-weight: 400;
+                padding: 2px 0 6px 0;
+            }}
             QPushButton#LinkButton {{
                 background: transparent;
                 color: {c.link};

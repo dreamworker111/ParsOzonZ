@@ -41,7 +41,7 @@ class GuiModeSmokeTests(unittest.TestCase):
         window.show()
         self.app.processEvents()
         try:
-            self.assertTrue(window.chrome_btn.isVisible())
+            self.assertTrue(window.chrome_mode_label.isVisible())
             self.assertFalse(window.mobile_login_btn.isVisible())
 
             window.browser_mode_combo.setCurrentIndex(
@@ -52,7 +52,7 @@ class GuiModeSmokeTests(unittest.TestCase):
             )
             self.app.processEvents()
 
-            self.assertFalse(window.chrome_btn.isVisible())
+            self.assertFalse(window.chrome_mode_label.isVisible())
             self.assertTrue(window.mobile_login_btn.isVisible())
             with (
                 patch(

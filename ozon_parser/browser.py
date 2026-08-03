@@ -125,7 +125,10 @@ def _apply_mobile_stealth(context: BrowserContext) -> None:
 def connect_via_cdp(playwright: Playwright, progress=None) -> tuple[Browser, BrowserContext, Page]:
     log = progress or (lambda _m: None)
     if not ensure_chrome_for_ozon(log):
-        raise RuntimeError("Запустите Chrome через «Открыть Chrome для Ozon» или chrome_for_ozon.bat")
+        raise RuntimeError(
+            "Не удалось подключить Chrome. Нажмите «Загрузить категории» — "
+            "Chrome откроется автоматически, либо запустите chrome_for_ozon.bat"
+        )
     browser = playwright.chromium.connect_over_cdp(CDP_URL)
     context = browser.contexts[0] if browser.contexts else browser.new_context()
     page = context.pages[0] if context.pages else context.new_page()
@@ -300,18 +303,65 @@ def settle_mobile_login(page: Page, progress=None) -> None:
         pass
 
 
+def page_has_usable_ozon_content(page: Page) -> bool:
+    """True when the tab shows a real Ozon page, not an empty antibot shell."""
+    try:
+        title = str(page.title() or "").lower()
+    except Exception:
+        title = ""
+    if "antibot challenge page" in title:
+        return False
+    try:
+        text = str(
+            page.evaluate("() => (document.body?.innerText || '').replace(/\\s+/g, ' ').trim()")
+            or ""
+        )
+    except Exception:
+        text = ""
+    if len(text) < 60:
+        return False
+    lowered = text.lower()
+    if is_blocked_page(page):
+        return False
+    markers = (
+        "ozon",
+        "магазин",
+        "категор",
+        "товар",
+        "корзин",
+        "каталог",
+        "продав",
+        "электроник",
+    )
+    return any(marker in lowered or marker in title for marker in markers)
+
+
 def is_antibot_challenge_page(page: Page) -> bool:
+    """Detect an active antibot challenge shell — not a finished page with leftover query flags."""
     try:
         title = str(page.title() or "").lower()
         if "antibot challenge page" in title:
             return True
-        url = str(getattr(page, "url", "") or "").lower()
-        if "__rr=1" in url and "ozon.ru" in url:
+        # After a passed check Ozon often keeps ?__rr=1&abt_att=1 on a normal page.
+        # That must NOT be treated as a challenge, otherwise catalog load never starts.
+        if page_has_usable_ozon_content(page):
+            return False
+        try:
+            text = str(
+                page.evaluate("() => (document.body?.innerText || '').trim()") or ""
+            )
+        except Exception:
+            text = ""
+        try:
+            html = str(
+                page.evaluate("() => document.documentElement?.innerHTML || ''") or ""
+            ).lower()
+        except Exception:
+            html = ""
+        if "abt-challenge" in html and len(text) < 80:
             return True
-        html = str(
-            page.evaluate("() => document.documentElement?.innerHTML || ''") or ""
-        ).lower()
-        if "abt-challenge" in html:
+        url = str(getattr(page, "url", "") or "").lower()
+        if "__rr=1" in url and "ozon.ru" in url and len(text) < 80:
             return True
         return False
     except Exception:
@@ -320,11 +370,11 @@ def is_antibot_challenge_page(page: Page) -> bool:
 
 def is_access_restricted(page: Page) -> bool:
     """True when Ozon is blocked, showing captcha, or running an antibot challenge."""
-    return (
-        is_blocked_page(page)
-        or is_captcha_page(page)
-        or is_antibot_challenge_page(page)
-    )
+    if is_blocked_page(page) or is_captcha_page(page):
+        return True
+    if is_antibot_challenge_page(page):
+        return True
+    return False
 
 
 def wait_for_ozon_ready(
@@ -338,22 +388,36 @@ def wait_for_ozon_ready(
     logged_wait = False
 
     while time.time() < deadline:
-        if is_blocked_page(page) or is_captcha_page(page):
-            return False
-        if not is_antibot_challenge_page(page):
-            try:
-                text = (page.evaluate("() => document.body?.innerText || ''") or "").strip()
-            except Exception:
-                text = ""
-            title = (page.title() or "").lower()
-            if text or ("ozon" in title and "antibot challenge page" not in title):
+        try:
+            if is_blocked_page(page) or is_captcha_page(page):
+                return False
+            if page_has_usable_ozon_content(page):
                 return True
+            if not is_antibot_challenge_page(page):
+                try:
+                    text = (
+                        page.evaluate("() => document.body?.innerText || ''") or ""
+                    ).strip()
+                except Exception:
+                    text = ""
+                title = str(page.title() or "").lower()
+                if text or ("ozon" in title and "antibot challenge page" not in title):
+                    return True
+        except Exception as exc:
+            # Tab closed mid-wait — treat as not ready.
+            if "closed" in str(exc).lower():
+                return False
         if not logged_wait:
             log("Ozon проверяет браузер, ожидаем загрузку...")
             logged_wait = True
         human_delay(3.0, 5.0)
 
-    return not is_antibot_challenge_page(page) and not is_blocked_page(page)
+    try:
+        return page_has_usable_ozon_content(page) or (
+            not is_antibot_challenge_page(page) and not is_blocked_page(page)
+        )
+    except Exception:
+        return False
 
 
 def ensure_ozon_session_ready(
@@ -614,7 +678,7 @@ def open_mobile_guest_session(
     details = "; ".join(profile_errors) if profile_errors else "неизвестная ошибка"
     raise RuntimeError(
         "Мобильный Ozon недоступен без авторизации. "
-        f"{details}. Нажмите «Открыть Chrome», дождитесь нормальной загрузки "
+        f"{details}. Chrome откроется при «Загрузить категории»; дождитесь нормальной загрузки "
         "сайта без «Инцидента», подождите 15–30 минут и повторите."
     )
 
@@ -748,6 +812,8 @@ def is_blocked_page(page: Page) -> bool:
             url = ""
         combined = f"{title}\n{text}"
         if "fab_chlg" in url or "fab_chlg" in combined:
+            return True
+        if "fab_" in url or "fab_" in combined:
             return True
         if "ограничил доступ" in combined or "доступ ограничен" in combined:
             return True

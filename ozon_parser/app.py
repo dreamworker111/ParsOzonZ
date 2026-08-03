@@ -32,13 +32,13 @@ from PyQt6.QtWidgets import (
 
 from ozon_parser.categories import CategoryTarget
 from ozon_parser.filters import FilterOptionNode
-from ozon_parser.chrome_launcher import launch_chrome_for_ozon
 from ozon_parser.config import (
     BrowserMode,
     DESKTOP_MODE,
     FONTS_DIR,
     MOBILE_MODE,
     OUTPUT_DIR,
+    POST_CATALOG_PARSE_COOLDOWN_HINT_SEC,
 )
 from ozon_parser.auth import has_mobile_saved_session
 from ozon_parser.export import ExportMeta, export_products
@@ -100,6 +100,8 @@ class FilterTreeWidget(QTreeWidget):
     ROLE_IS_PLACEHOLDER = Qt.ItemDataRole.UserRole + 9
     ROLE_EMPTY_SUBCATEGORIES = Qt.ItemDataRole.UserRole + 10
 
+    selectionChangedCount = pyqtSignal(int)
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.placeholder_color = QColor(THEMES["dark"].placeholder)
@@ -109,6 +111,13 @@ class FilterTreeWidget(QTreeWidget):
         self.setIndentation(22)
         self.itemChanged.connect(self._on_item_changed)
         self._block_signals = False
+
+    def selected_category_count(self) -> int:
+        """How many categories will be parsed with the current checkboxes."""
+        return len(self.selected_leaf_categories())
+
+    def _emit_selection_count(self) -> None:
+        self.selectionChangedCount.emit(self.selected_category_count())
 
     def set_placeholder_color(self, color: str) -> None:
         self.placeholder_color = QColor(color)
@@ -130,6 +139,7 @@ class FilterTreeWidget(QTreeWidget):
             self.addTopLevelItem(self._create_option_item("Категория", root, depth=0))
         self.expandToDepth(3)
         self._block_signals = False
+        self._emit_selection_count()
 
     def _style_placeholder_item(self, item: QTreeWidgetItem) -> None:
         item.setForeground(0, QBrush(self.placeholder_color))
@@ -172,6 +182,7 @@ class FilterTreeWidget(QTreeWidget):
         for i in range(self.topLevelItemCount()):
             walk(self.topLevelItem(i))
         self._block_signals = False
+        self._emit_selection_count()
 
     def reset_selection(self) -> None:
         self._block_signals = True
@@ -185,9 +196,11 @@ class FilterTreeWidget(QTreeWidget):
         for i in range(self.topLevelItemCount()):
             walk(self.topLevelItem(i))
         self._block_signals = False
+        self._emit_selection_count()
 
     def begin_incremental_load(self) -> None:
         self.clear()
+        self._emit_selection_count()
 
     def set_initial_roots(self, roots: list[FilterOptionNode]) -> None:
         self._block_signals = True
@@ -251,6 +264,7 @@ class FilterTreeWidget(QTreeWidget):
             self._finalize_subcategory_placeholders(self.topLevelItem(i))
             self._expand_item_branch(self.topLevelItem(i))
         self._block_signals = False
+        self._emit_selection_count()
 
     def merge_subcategories(self, mapping: dict[str, list[FilterOptionNode]]) -> int:
         added = 0
@@ -354,6 +368,7 @@ class FilterTreeWidget(QTreeWidget):
             self._set_children_state(item, state)
         self._update_parent_state(item.parent())
         self._block_signals = False
+        self._emit_selection_count()
 
     def _set_children_state(self, item: QTreeWidgetItem, state: Qt.CheckState) -> None:
         for i in range(item.childCount()):
@@ -427,6 +442,11 @@ class FilterTreeWidget(QTreeWidget):
         return False
 
     def selected_targets(self) -> list[CategoryTarget]:
+        """Leaf targets for parsing.
+
+        Parent checkbox still marks all children in the UI; for parsing we walk
+        down to leaves so each child is processed one-by-one in order.
+        """
         targets: list[CategoryTarget] = []
 
         def walk(item: QTreeWidgetItem) -> None:
@@ -444,7 +464,7 @@ class FilterTreeWidget(QTreeWidget):
                     walk(item.child(i))
                 return
 
-            # Checked: если отмечены подкатегории — парсим только их, не родителя
+            # Checked parent with children → parse children sequentially, not the parent.
             if self._has_checked_descendant(item):
                 for i in range(item.childCount()):
                     walk(item.child(i))
@@ -769,12 +789,20 @@ class MainWindow(QMainWindow):
         self.max_products = QSpinBox()
         self.max_products.setRange(1, 100000)
         self.max_products.setValue(100)
+        self.max_products.setToolTip(
+            "До 10000+ за один запуск: парсер сам делает автопаузы "
+            "каждые 25 товаров и длинные паузы каждые 400, "
+            "чтобы снизить риск fab_/«нет соединения»."
+        )
         params_layout.addWidget(self.max_products)
 
-        self.chrome_btn = QPushButton("Открыть Chrome")
-        self.chrome_btn.clicked.connect(self.launch_chrome)
-        setup_action_button(self.chrome_btn, min_height=44)
-        params_layout.addWidget(self.chrome_btn)
+        self.chrome_mode_label = QLabel("Парсер работает через Chrome")
+        self.chrome_mode_label.setObjectName("ChromeModeHint")
+        self.chrome_mode_label.setWordWrap(True)
+        self.chrome_mode_label.setToolTip(
+            "Chrome открывается автоматически при загрузке категорий и парсинге"
+        )
+        params_layout.addWidget(self.chrome_mode_label)
 
         self.mobile_login_btn = QPushButton("Войти в мобильный Ozon")
         self.mobile_login_btn.clicked.connect(self.launch_mobile_login)
@@ -784,7 +812,7 @@ class MainWindow(QMainWindow):
         self.auth_mode_combo.currentIndexChanged.connect(self._on_session_mode_changed)
         self._update_session_controls()
 
-        self.detail_status_label = QLabel("Откройте Chrome и загрузите категории")
+        self.detail_status_label = QLabel("Загрузите категории, чтобы начать")
         self.detail_status_label.setWordWrap(True)
         self.detail_status_label.setObjectName("DetailStatus")
         params_layout.addWidget(self.detail_status_label)
@@ -839,6 +867,13 @@ class MainWindow(QMainWindow):
         self.reset_cat_btn.clicked.connect(self._reset_categories)
         cat_header.addWidget(self.reset_cat_btn)
 
+        self.selected_cat_count_label = QLabel("Выбрано: 0")
+        self.selected_cat_count_label.setObjectName("SelectedCategoryCount")
+        self.selected_cat_count_label.setToolTip(
+            "Сколько категорий отмечено сейчас — столько уйдёт в парсер"
+        )
+        cat_header.addWidget(self.selected_cat_count_label)
+
         self.rename_cat_btn = QPushButton("✎")
         self.rename_cat_btn.setObjectName("LinkButton")
         self.rename_cat_btn.setToolTip("Переименовать выбранную категорию")
@@ -856,6 +891,9 @@ class MainWindow(QMainWindow):
         self.category_tree.setMinimumHeight(200)
         self.category_tree.currentItemChanged.connect(
             self._update_rename_category_button
+        )
+        self.category_tree.selectionChangedCount.connect(
+            self._update_selected_categories_count
         )
         cat_inner.addWidget(self.category_tree, stretch=1)
 
@@ -938,8 +976,7 @@ class MainWindow(QMainWindow):
     def _update_session_controls(self) -> None:
         mobile = self._selected_browser_mode() == MOBILE_MODE
         use_auth = self._selected_use_auth()
-        self.chrome_btn.setVisible(not mobile)
-        self.chrome_btn.setEnabled(not mobile)
+        self.chrome_mode_label.setVisible(not mobile)
         self.mobile_login_btn.setVisible(mobile and use_auth)
         self.mobile_login_btn.setEnabled(
             mobile
@@ -961,6 +998,7 @@ class MainWindow(QMainWindow):
             )
         ):
             self.category_tree.clear()
+            self._update_selected_categories_count(0)
             self._loaded_category_mode = None
             self._loaded_category_auth = None
             self._loaded_specific_seller = None
@@ -1095,18 +1133,6 @@ class MainWindow(QMainWindow):
         if status.total_count:
             self._set_progress_fraction(status.current_index, status.total_count)
 
-    def launch_chrome(self) -> None:
-        if launch_chrome_for_ozon():
-            msg = "Chrome открыт. Дождитесь загрузки Ozon, затем нажмите «Загрузить категории»"
-            self.status_label.setText(msg)
-            self._append_log(msg)
-        else:
-            QMessageBox.warning(
-                self,
-                "Chrome не найден",
-                "Установите Google Chrome или запустите chrome_for_ozon.bat вручную.",
-            )
-
     def launch_mobile_login(self) -> None:
         if self.mobile_login_worker and self.mobile_login_worker.isRunning():
             return
@@ -1199,6 +1225,11 @@ class MainWindow(QMainWindow):
 
     def _reset_categories(self) -> None:
         self.category_tree.reset_selection()
+
+    def _update_selected_categories_count(self, count: int | None = None) -> None:
+        if count is None:
+            count = self.category_tree.selected_category_count()
+        self.selected_cat_count_label.setText(f"Выбрано: {count}")
 
     def _update_rename_category_button(self, current=None, _previous=None) -> None:
         can_rename = (
@@ -1326,10 +1357,32 @@ class MainWindow(QMainWindow):
         sub_count = self._count_subcategories(categories)
         total = self._catalog_subcat_total or len(categories)
         with_subcats = sum(1 for c in categories if c.children)
+        cooldown_min = max(1, int(POST_CATALOG_PARSE_COOLDOWN_HINT_SEC // 60))
         if self._loaded_specific_seller is False:
             self.status_label.setText(
                 f"Полный каталог загружен: {len(categories)} разделов, "
-                f"{sub_count} подкатегорий/веток. Товары будут собраны у всех продавцов."
+                f"{sub_count} подкатегорий/веток. Пауза {cooldown_min} мин перед парсингом "
+                "снижает риск «нет соединения» / fab_."
+            )
+            self._append_log(
+                f"Рекомендация: подождите ~{cooldown_min} мин. Не жмите F5 в Chrome. "
+                "Каталог уже в дереве/кэше — можно закрыть вкладку Ozon и позже "
+                "отметить категории и запустить парсер."
+            )
+            QMessageBox.information(
+                self,
+                "Каталог загружен — длинная пауза перед парсингом",
+                (
+                    f"Полный каталог собран ({len(categories)} разделов).\n\n"
+                    f"После сбора Composer Ozon часто показывает "
+                    f"«Похоже, нет соединения» / fab_ — это не ошибка интернета.\n\n"
+                    f"Подождите около {cooldown_min} минут:\n"
+                    f"• не обновляйте страницу (F5 ухудшает бан)\n"
+                    f"• вкладку можно оставить на about:blank или закрыть\n"
+                    f"• затем отметьте категории и запустите парсер\n\n"
+                    f"Повторная «Загрузить категории» возьмёт дерево из кэша "
+                    f"без новых запросов, пока кэш свежий."
+                ),
             )
         elif total and with_subcats < total:
             self.status_label.setText(
@@ -1356,7 +1409,7 @@ class MainWindow(QMainWindow):
         self.status_label.setText(f"Ошибка загрузки категорий: {error}")
         hint = (
             "Ozon заблокировал доступ (это не ошибка интернета).\n\n"
-            "1. Нажмите «Открыть Chrome для Ozon»\n"
+            "1. Chrome откроется сам при «Загрузить категории»\n"
             "2. Если видите fab_/«Похоже, нет соединения» — подождите 15–30 минут\n"
             "3. Обновите страницу один раз только после ожидания\n"
             "4. Повторите «Загрузить категории»"
@@ -1412,22 +1465,39 @@ class MainWindow(QMainWindow):
             return
 
         if not specific_seller and len(categories) >= 50:
+            goal = self.max_products.value()
             self._append_log(
-                f"Выбрано категорий: {len(categories)}. "
-                "Для общего каталога сессии короткие (1 категория за запуск), "
-                "чтобы избежать fab_/«Похоже, нет соединения». "
-                "Продолжайте повторными запусками с checkpoint."
+                f"Выбрано категорий: {len(categories)}. Цель: {goal} товаров. "
+                "Один запуск идёт волнами с автопаузами (без ручных перезапусков)."
             )
             answer = QMessageBox.question(
                 self,
                 "Большой выбор категорий",
                 (
-                    f"Выбрано {len(categories)} категорий общего каталога.\n\n"
-                    "Чтобы не получать инцидент fab_, за одну сессию будет "
-                    "обработана только 1 категория. Прогресс сохранится — "
-                    "запускайте парсер снова, пока не пройдёте все.\n\n"
-                    "Перед стартом откройте Chrome и убедитесь, что Ozon "
-                    "открывается без «Похоже, нет соединения».\n\n"
+                    f"Выбрано {len(categories)} категорий общего каталога.\n"
+                    f"Цель: {goal} товаров за один запуск.\n\n"
+                    "Парсер будет работать непрерывно с автопаузами:\n"
+                    "• каждые 25 товаров\n"
+                    "• длинная пауза каждые 400 товаров\n"
+                    "• пауза после каждой волны категорий\n"
+                    "• ожидание разбана без F5 при fab_\n\n"
+                    "Это может занять много часов. Не обновляйте Chrome вручную.\n\n"
+                    "Продолжить?"
+                ),
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.Yes,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+        elif self.max_products.value() >= 1000:
+            goal = self.max_products.value()
+            answer = QMessageBox.question(
+                self,
+                "Большой объём товаров",
+                (
+                    f"Цель: {goal} товаров за один запуск.\n\n"
+                    "Парсер автоматически делает защитные паузы и сохраняет "
+                    "checkpoint. Запуск может идти несколько часов.\n\n"
                     "Продолжить?"
                 ),
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
@@ -1543,9 +1613,9 @@ class MainWindow(QMainWindow):
         abs_path = filepath
         has_checkpoint = CHECKPOINT_PATH.exists()
         status = (
-            f"Сессия: {len(products)} товаров за {duration_text}. "
+            f"Собрано: {len(products)} товаров за {duration_text}. "
             + (
-                "Прогресс сохранён — запустите снова для продолжения."
+                "Прогресс сохранён — можно продолжить тем же запуском позже."
                 if has_checkpoint
                 else "Сбор завершён. Нажмите «Скачать XLSX»."
             )
@@ -1557,14 +1627,18 @@ class MainWindow(QMainWindow):
                 self._append_log(timing.summary_line())
         message = (
             f"Сохранено {len(products)} товаров\n"
-            f"Время сессии: {duration_text}\n\n{abs_path}"
+            f"Время: {duration_text}\n\n{abs_path}"
         )
         if has_checkpoint:
             message += (
-                "\n\nПрогресс сохранён. Чтобы набрать большой объём, "
-                "запускайте парсер снова с теми же категориями после паузы."
+                "\n\nСбор ещё не дошёл до цели. Checkpoint сохранён — "
+                "запустите парсер снова с теми же категориями после паузы."
             )
-        QMessageBox.information(self, "Сессия завершена", message)
+        QMessageBox.information(
+            self,
+            "Готово" if not has_checkpoint else "Прогресс сохранён",
+            message,
+        )
 
     def _on_parse_failed(self, error: str) -> None:
         self._set_app_status(self.STATUS_IDLE, parsing=False)

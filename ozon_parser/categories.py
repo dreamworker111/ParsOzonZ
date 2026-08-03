@@ -13,6 +13,7 @@ from .browser import (
     is_blocked_page,
     is_captcha_page,
     is_seller_page,
+    page_has_usable_ozon_content,
     recover_access,
     safe_goto,
     wait_for_ozon_ready,
@@ -48,7 +49,15 @@ from .config import (
     DESKTOP_BASE_URL,
     DESKTOP_MODE,
     GLOBAL_CATALOG_PATH,
+    GLOBAL_COMPOSER_BATCH_CONCURRENCY,
+    GLOBAL_COMPOSER_BATCH_PAUSE_MAX,
+    GLOBAL_COMPOSER_BATCH_PAUSE_MIN,
     GLOBAL_COMPOSER_BATCH_SIZE,
+    GLOBAL_COMPOSER_LONG_EVERY_N,
+    GLOBAL_COMPOSER_LONG_PAUSE_MAX,
+    GLOBAL_COMPOSER_LONG_PAUSE_MIN,
+    GLOBAL_COMPOSER_ROOT_PAUSE_MAX,
+    GLOBAL_COMPOSER_ROOT_PAUSE_MIN,
     MOBILE_BASE_URL,
     MOBILE_DESKTOP_HOST_SESSIONS,
     MOBILE_MODE,
@@ -536,22 +545,61 @@ class CategoryLoader:
             # Browser navigation still prefers /seller/ (see _load_global_root_categories).
             category_base = base.rstrip("/") + GLOBAL_CATALOG_PATH
             root_ids = [str(root["id"]) for root in raw_roots]
-            root_children = self._fetch_categories_batch(
-                category_base,
-                root_ids,
-                log,
-            )
+            if is_access_restricted(self.page) or is_blocked_page(self.page):
+                raise self._global_catalog_access_error(
+                    "Доступ ограничен до загрузки веток каталога."
+                )
+            root_children: dict[str, list[dict]] = {}
+            chunk = max(1, int(GLOBAL_COMPOSER_BATCH_SIZE))
+            for offset in range(0, len(root_ids), chunk):
+                if is_access_restricted(self.page) or is_blocked_page(self.page):
+                    raise self._global_catalog_access_error(
+                        "Доступ ограничен во время загрузки корневых веток."
+                    )
+                part_ids = root_ids[offset : offset + chunk]
+                part = self._fetch_categories_batch(category_base, part_ids, log)
+                if part is None:
+                    raise self._global_catalog_access_error(
+                        "Composer API вернул блокировку при загрузке корневых веток."
+                    )
+                root_children.update(part)
+                if offset + chunk < len(root_ids):
+                    human_delay(
+                        GLOBAL_COMPOSER_BATCH_PAUSE_MIN,
+                        GLOBAL_COMPOSER_BATCH_PAUSE_MAX,
+                    )
             deadline = (
                 time.monotonic() + max(60, timeout_sec)
                 if timeout_sec is not None
                 else None
             )
             for index, root in enumerate(raw_roots, start=1):
+                if is_access_restricted(self.page) or is_blocked_page(self.page):
+                    log(
+                        f"Остановка: блокировка Ozon после {index - 1}/{len(raw_roots)} веток"
+                    )
+                    break
                 if deadline is not None and self._past_deadline(deadline):
                     log(
                         f"Лимит времени: обработано {index - 1}/{len(raw_roots)} веток"
                     )
                     break
+                if index > 1:
+                    log(
+                        "Пауза перед следующей корневой веткой "
+                        f"({int(GLOBAL_COMPOSER_ROOT_PAUSE_MIN)}–"
+                        f"{int(GLOBAL_COMPOSER_ROOT_PAUSE_MAX)} сек)..."
+                    )
+                    human_delay(
+                        GLOBAL_COMPOSER_ROOT_PAUSE_MIN,
+                        GLOBAL_COMPOSER_ROOT_PAUSE_MAX,
+                    )
+                    if is_access_restricted(self.page) or is_blocked_page(self.page):
+                        log(
+                            f"Остановка: блокировка Ozon перед веткой "
+                            f"{index}/{len(raw_roots)}"
+                        )
+                        break
                 root_id = str(root["id"])
                 log(f"Ветка {index}/{len(raw_roots)}: {root['name']}")
                 root["children"] = root_children.get(root_id) or []
@@ -573,6 +621,15 @@ class CategoryLoader:
             if not result:
                 raise ConnectionError("Полный каталог Ozon не распознан.")
             subtotal = sum(self._count_option_descendants(node) for node in result)
+            blocked_after = self._page_access_blocked()
+            if blocked_after:
+                incident = extract_incident_id(self.page) or "fab_"
+                log(
+                    f"Каталог собран частично/полностью, но Chrome уже под fab_ "
+                    f"({incident}). Не обновляйте страницу — подождите 15–30 мин."
+                )
+            else:
+                self._park_catalog_tab(log)
             log(
                 f"Готово: полный каталог Ozon — {len(result)} корневых разделов, "
                 f"всего узлов: {subtotal}"
@@ -710,8 +767,14 @@ class CategoryLoader:
                 batch.append((node, depth))
 
             if batch:
+                if is_access_restricted(self.page) or is_blocked_page(self.page):
+                    log("  остановка дозагрузки: Ozon ограничил доступ (fab_)")
+                    return
                 ids = [str(n["id"]) for n, _ in batch]
                 results = self._fetch_categories_batch(seller_base, ids, log)
+                if results is None:
+                    log("  пакет категорий недоступен из‑за блокировки — стоп")
+                    return
                 for node, depth in batch:
                     cid = str(node["id"])
                     children = results.get(cid) or []
@@ -720,8 +783,30 @@ class CategoryLoader:
                         fetched += 1
                         for child in children:
                             next_queue.append((child, depth + 1))
-                if fetched and fetched % 20 == 0:
+                if fetched and fetched % 40 == 0:
                     log(f"  дозагружено веток: {fetched}...")
+                if any(results.get(str(n["id"])) for n, _ in batch):
+                    # Human-like gap after every Composer batch (anti fab_).
+                    human_delay(
+                        GLOBAL_COMPOSER_BATCH_PAUSE_MIN,
+                        GLOBAL_COMPOSER_BATCH_PAUSE_MAX,
+                    )
+                    if (
+                        fetched
+                        and GLOBAL_COMPOSER_LONG_EVERY_N > 0
+                        and fetched % GLOBAL_COMPOSER_LONG_EVERY_N == 0
+                    ):
+                        log(
+                            "  длинная пауза Composer "
+                            f"(каждые {GLOBAL_COMPOSER_LONG_EVERY_N} пакетов)..."
+                        )
+                        human_delay(
+                            GLOBAL_COMPOSER_LONG_PAUSE_MIN,
+                            GLOBAL_COMPOSER_LONG_PAUSE_MAX,
+                        )
+                    if is_access_restricted(self.page) or is_blocked_page(self.page):
+                        log("  остановка дозагрузки: fab_ после паузы")
+                        return
 
             queue.extend(next_queue)
             if not batch and next_queue:
@@ -772,6 +857,23 @@ class CategoryLoader:
     def _past_deadline(self, deadline: float) -> bool:
         return time.monotonic() >= deadline
 
+    def _park_catalog_tab(self, log) -> None:
+        """Stop Ozon SPA activity after tree load so the tab stays quiet."""
+        if self._page_access_blocked():
+            return
+        try:
+            current = str(getattr(self.page, "url", "") or "")
+        except Exception:
+            current = ""
+        if not current or current.startswith("about:"):
+            return
+        log("Успокаиваем вкладку Chrome (без F5 по Ozon) после сбора каталога...")
+        try:
+            # about:blank stops Composer/SPA polling that often flips the tab to fab_.
+            self.page.goto("about:blank", wait_until="domcontentloaded", timeout=15000)
+        except Exception as exc:
+            log(f"Не удалось увести вкладку с Ozon: {exc}")
+
     def _count_option_descendants(self, node: FilterOptionNode) -> int:
         total = 0
         for child in node.children:
@@ -805,13 +907,17 @@ class CategoryLoader:
         seller_base: str,
         category_ids: list[str],
         log,
-    ) -> dict[str, list[dict]]:
+    ) -> dict[str, list[dict]] | None:
         if not category_ids:
             return {}
 
+        if is_access_restricted(self.page) or is_blocked_page(self.page):
+            log("Пакетный запрос категорий отменён: доступ ограничен")
+            return None
+
         url_pairs = [self._composer_urls_for_category(seller_base, cid) for cid in category_ids]
         script = """
-        async ({ items, clientName }) => {
+        async ({ items, clientName, concurrencyLimit }) => {
             const fetchOne = async ({ path, fullUrl }) => {
                 const candidates = [
                     '/api/composer-api.bx/page/json/v2?url=' + encodeURIComponent(path),
@@ -835,9 +941,20 @@ class CategoryLoader:
                 return null;
             };
             const out = {};
-            await Promise.all(items.map(async (item) => {
-                out[item.path] = await fetchOne(item);
-            }));
+            const queue = items.slice();
+            // Sequential by default — parallel workers were triggering fab_ mid-tree.
+            const concurrency = Math.max(
+                1,
+                Math.min(Number(concurrencyLimit) || 1, queue.length || 1)
+            );
+            const workers = Array.from({length: concurrency}, async () => {
+                while (queue.length) {
+                    const item = queue.shift();
+                    if (!item) break;
+                    out[item.path] = await fetchOne(item);
+                }
+            });
+            await Promise.all(workers);
             return JSON.stringify(out);
         }
         """
@@ -845,16 +962,23 @@ class CategoryLoader:
         if is_antibot_challenge_page(self.page):
             log("Ozon проверяет браузер перед пакетным запросом категорий...")
             if not wait_for_ozon_ready(self.page, log):
-                return result
+                return None
         try:
             payload_items = [{"path": p, "fullUrl": u} for p, u in url_pairs]
             client_name = "mweb_client" if self.browser_mode == MOBILE_MODE else "dweb_client"
             raw = self.page.evaluate(
                 script,
-                {"items": payload_items, "clientName": client_name},
+                {
+                    "items": payload_items,
+                    "clientName": client_name,
+                    "concurrencyLimit": int(GLOBAL_COMPOSER_BATCH_CONCURRENCY),
+                },
             )
             if not raw:
                 return result
+            if "fab_chlg" in raw.lower() or "похоже, нет соединения" in raw.lower():
+                log("Composer вернул страницу блокировки — останавливаем сбор категорий")
+                return None
             payload = json.loads(raw)
             filter_parser = SellerCategoryCollector(
                 self.page,
@@ -887,6 +1011,9 @@ class CategoryLoader:
                     subcats, cid, page_category_id=cid,
                 )
         except Exception as exc:
+            if is_access_restricted(self.page) or is_blocked_page(self.page):
+                log(f"Пакетный API категорий остановлен (блокировка): {exc}")
+                return None
             log(f"Пакетный API категорий: {exc}")
         return result
 
@@ -1026,7 +1153,7 @@ class CategoryLoader:
         parent_id: str,
         log,
     ) -> list[dict]:
-        batch = self._fetch_categories_batch(seller_base, [parent_id], log)
+        batch = self._fetch_categories_batch(seller_base, [parent_id], log) or {}
         return batch.get(parent_id) or []
 
     def _wait_for_category_links(self, fast: bool = True) -> None:
@@ -1387,6 +1514,8 @@ class CategoryLoader:
             return False
 
     def _ensure_page_ready_for_catalog(self, log, on_manual_bypass) -> bool:
+        if page_has_usable_ozon_content(self.page) and not self._page_access_blocked():
+            return True
         if wait_for_ozon_ready(self.page, log):
             return True
         if is_antibot_challenge_page(self.page):
@@ -1421,8 +1550,8 @@ class CategoryLoader:
         else:
             parts.append(detail or "Общий каталог не вернул корневые категории.")
             parts.append(
-                "Откройте Chrome для Ozon, убедитесь что сайт загружается, "
-                "затем повторите загрузку категорий."
+                "Chrome откроется при «Загрузить категории». "
+                "Убедитесь, что сайт загружается без блокировки, затем повторите."
             )
         return ConnectionError("\n".join(parts))
 
@@ -1447,6 +1576,23 @@ class CategoryLoader:
                 return []
             if not self._ensure_page_ready_for_catalog(log, on_manual_bypass):
                 return []
+
+        # If Chrome already shows a usable Ozon page (often with leftover
+        # ?__rr=1&abt_att=1), collect roots without another navigation.
+        try:
+            current = str(getattr(self.page, "url", "") or "")
+        except Exception:
+            current = ""
+        if (
+            "ozon.ru" in current.lower()
+            and not self._page_access_blocked()
+            and page_has_usable_ozon_content(self.page)
+        ):
+            log("Собираем корневые категории с уже открытой страницы...")
+            roots = self._collect_root_categories(log)
+            if len(roots) >= 2:
+                log(f"Найдено корневых категорий: {len(roots)}")
+                return roots
 
         for source_url in candidates:
             if self._page_access_blocked():

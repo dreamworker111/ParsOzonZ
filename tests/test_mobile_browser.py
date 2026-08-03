@@ -163,6 +163,19 @@ class BrowserModeTests(unittest.TestCase):
 
         self.assertTrue(browser.is_antibot_challenge_page(page))
 
+    def test_passed_challenge_query_flags_are_not_antibot(self):
+        page = Mock()
+        page.url = "https://www.ozon.ru/seller/?__rr=1&abt_att=1"
+        page.title.return_value = "Все магазины на Ozon — полный список селлеров"
+        page.evaluate.return_value = (
+            "Все магазины на Ozon полный список селлеров маркетплейса "
+            "каталог категорий электроника одежда дом и сад товары"
+        )
+
+        self.assertFalse(browser.is_antibot_challenge_page(page))
+        self.assertTrue(browser.page_has_usable_ozon_content(page))
+        self.assertFalse(browser.is_access_restricted(page))
+
     def test_blocked_navigation_waits_for_manual_confirmation(self):
         page = Mock()
         page.url = "https://m.ozon.ru/"

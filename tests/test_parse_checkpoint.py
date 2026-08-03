@@ -79,7 +79,17 @@ class ParseCheckpointTests(unittest.TestCase):
         parser = OzonParser()
         cats, products = parser._session_budgets(self._settings(10_000))
         self.assertLessEqual(cats, 3)
-        self.assertLessEqual(products, 250)
+        self.assertLessEqual(products, 300)
+
+    def test_wave_budgets_keep_10k_in_one_run_soft_limits(self):
+        from ozon_parser.parser import OzonParser
+
+        parser = OzonParser()
+        cats, products = parser._wave_budgets(self._settings(10_000))
+        # Soft wave only — run continues after auto cooldown.
+        self.assertLessEqual(cats, 3)
+        self.assertLessEqual(products, 300)
+        self.assertGreaterEqual(products, 50)
 
     def test_process_card_skips_detail_pages_in_bulk_mode(self):
         from unittest.mock import Mock

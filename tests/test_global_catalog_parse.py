@@ -21,10 +21,11 @@ class GlobalCatalogParseUrlTests(unittest.TestCase):
         )
         url = self.parser._build_global_catalog_url(target, DESKTOP_MODE)
 
-        self.assertIn("/seller/", url)
+        self.assertIn("/seller/0/", url)
         self.assertIn("category=15500", url)
         self.assertNotIn("/category/15500", url)
         self.assertIn("sorting=price", url)
+        self.assertNotRegex(url, r"/seller/\?category=")
 
     def test_global_url_resolves_id_from_tree_key(self):
         target = CategoryTarget(
