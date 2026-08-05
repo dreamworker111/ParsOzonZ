@@ -7,6 +7,8 @@ import re
 from typing import Any
 from urllib.parse import urljoin
 
+from ozon_parser.utils import extract_ozon_product_id, pick_product_name
+
 
 _PRODUCT_HREF_RE = re.compile(r"/product/[^\"'\s?#]+", re.I)
 
@@ -86,15 +88,7 @@ def _card_from_tile_item(item: dict, *, base_url: str) -> dict | None:
         href = urljoin(base_url.rstrip("/") + "/", href.lstrip("/"))
 
     texts = _texts_from_main_state(item.get("mainState"))
-    name = ""
-    for text in texts:
-        if "₽" in text:
-            continue
-        if re.fullmatch(r"\d+[.,]?\d*", text.replace(" ", "")):
-            continue
-        if len(text) > 2:
-            name = text
-            break
+    name = pick_product_name(*texts)
     body = "\n".join(texts)
     if not body:
         body = name
@@ -135,9 +129,10 @@ def _extract_tile_grid_cards(data: dict, *, base_url: str) -> list[dict]:
             if not card:
                 continue
             href = card["href"]
-            if href in seen:
+            key = extract_ozon_product_id(href) or href
+            if key in seen:
                 continue
-            seen.add(href)
+            seen.add(key)
             cards.append(card)
     return cards
 
@@ -170,14 +165,15 @@ def extract_product_cards_from_composer(
         href = href.split("?")[0].split("#")[0]
         if href.startswith("/"):
             href = urljoin(base_url.rstrip("/") + "/", href.lstrip("/"))
-        if href in seen:
+        key = extract_ozon_product_id(href) or href
+        if key in seen:
             continue
         texts = _texts_from_main_state(node.get("mainState"))
-        name = next((t for t in texts if "₽" not in t and len(t) > 2), "")
+        name = pick_product_name(*texts)
         body = "\n".join(texts) or name
         if "₽" not in body and not name:
             continue
-        seen.add(href)
+        seen.add(key)
         out.append({"href": href, "name": name, "text": body, "html": body})
     return out
 

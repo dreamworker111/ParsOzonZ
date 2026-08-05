@@ -7,5 +7,10 @@ build/
 session/
 .idea/
 *.xlsx
+*.xls
+*.csv
+output_*.json
+parse_checkpoint.json
 cache/
 data/
+

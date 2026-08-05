@@ -303,6 +303,12 @@ def build_stylesheet(
                 border: 1px solid {c.group_border};
                 background: {c.window_bg};
                 padding: 4px 2px;
+                show-decoration-selected: 1;
+            }}
+            QTreeWidget#CategoryTree::item {{
+                padding: 4px 6px 4px 2px;
+                min-height: 26px;
+                border-radius: 4px;
             }}
             QTreeWidget::item {{
                 padding: 5px 2px;

@@ -61,12 +61,57 @@ def with_price_sort_asc(
     session_mode: str | None = None,
 ) -> str:
     """Добавляет сортировку «по возрастанию цены» к URL каталога Ozon."""
+    return sanitize_catalog_url(
+        url,
+        browser_mode=browser_mode,
+        session_mode=session_mode,
+        keep_sorting=True,
+    )
+
+
+def sanitize_catalog_url(
+    url: str,
+    *,
+    param_key: str = "",
+    param_value: str = "",
+    category_id: str = "",
+    browser_mode: BrowserMode = DESKTOP_MODE,
+    session_mode: str | None = None,
+    keep_sorting: bool = True,
+) -> str:
+    """Rebuild a seller/catalog URL with only the intended filter parameters.
+
+    Ozon filter links often carry stale query flags (opened, layout, page, …) that
+    lead to «Не нашли товары / Сбросить фильтры» empty states.
+    """
     url = route_browser_url(url, browser_mode, session_mode)
     parsed = urlparse(url)
-    params = dict(parse_qsl(parsed.query, keep_blank_values=True))
-    params["sorting"] = "price"
+    path_lower = (parsed.path or "").lower()
+    existing = dict(parse_qsl(parsed.query, keep_blank_values=True))
+
+    params: dict[str, str] = {}
+    category = str(category_id or "").strip()
+    key = str(param_key or "").strip()
+    value = str(param_value or "").strip()
+
+    if key == "category" and value:
+        category = value
+    elif not category:
+        category = str(existing.get("category") or "").strip()
+
+    if category and "/seller/" in path_lower:
+        params["category"] = category
+
+    if key and value and key != "category":
+        params[key] = value
+
+    if keep_sorting:
+        params["sorting"] = "price"
+
     query = urlencode(params)
-    return urlunparse((parsed.scheme, parsed.netloc, parsed.path, parsed.params, query, parsed.fragment))
+    return urlunparse(
+        (parsed.scheme, parsed.netloc, parsed.path, parsed.params, query, parsed.fragment)
+    )
 
 
 def to_mobile_url(url: str) -> str:
@@ -111,6 +156,18 @@ def to_desktop_product_url(url: str) -> str:
     return url.replace("m.ozon.ru", "www.ozon.ru")
 
 
+def extract_ozon_product_id(url: str | None) -> str:
+    """Numeric Ozon product id from a /product/... URL (same item, different slugs)."""
+    if not url:
+        return ""
+    path = urlparse(to_desktop_product_url(str(url))).path or ""
+    match = re.search(r"/product/(?:[^/]*?-)?(\d{6,})/?(?:$|[?#])", path, re.I)
+    if match:
+        return match.group(1)
+    match = re.search(r"/product/[^/?#]*?(\d{6,})", path, re.I)
+    return match.group(1) if match else ""
+
+
 def parse_price(text: str | None) -> float | None:
     if not text:
         return None
@@ -134,6 +191,10 @@ def has_bonus_text(text: str) -> bool:
         return True
     if "баллы за отзыв" in lower or "баллов за отзыв" in lower:
         return True
+    # Ozon often shows "200 ₽ за отзыв" without the word "балл".
+    if re.search(r"за\s*отзыв", lower):
+        if re.search(r"\d", lower) or "₽" in lower or "руб" in lower:
+            return True
     return False
 
 
@@ -155,6 +216,134 @@ def parse_bonus_points(text: str | None) -> int | None:
         match = re.search(r"(\d+)", text)
         return int(match.group(1)) if match else None
     return None
+
+
+# Listing badges / stock / promo labels that must not become the product title.
+_PRODUCT_NAME_NOISE_FULL = re.compile(
+    r"(?is)^(?:"
+    r"\d+\s*шт\.?"
+    r"|осталось\s+\d+\s*шт\.?"
+    r"|распродажа"
+    r"|суперцена"
+    r"|хит(?:\s*продаж)?"
+    r"|новинка"
+    r"|акция"
+    r"|скидка"
+    r"|оригинал"
+    r"|premium"
+    r"|выбор\s+покупателей?"
+    r"|цена\s+что\s+надо"
+    r"|ценопад"
+    r"|в\s+корзину"
+    r"|в\s+избранное"
+    r"|купить"
+    r"|завтра"
+    r"|сегодня"
+    r"|послезавтра"
+    r"|бесплатная\s+доставка"
+    r"|доставка\s+\S+"
+    r"|курьером"
+    r"|[\d\s]+[-–—]?\s*(?:январ|феврал|март|апрел|ма[йя]|июн|июл|август|сентябр|октябр|ноябр|декабр)\w*"
+    r"|[-−+]?\d+\s*%"
+    r"|\d([.,]\d)?\s*(?:★|⭐)?"
+    r"|\d+\s*(?:отзыв|оценк)\w*"
+    r"|цвет\s*:.+"
+    r"|размер\s*:.+"
+    r")$",
+)
+
+_PRODUCT_NAME_NOISE_INLINE = re.compile(
+    r"(?is)(?:^|\s+)(?:"
+    r"\d+\s*шт\.?"
+    r"|осталось\s+\d+\s*шт\.?"
+    r"|распродажа"
+    r"|суперцена"
+    r"|хит(?:\s*продаж)?"
+    r"|новинка"
+    r"|акция"
+    r"|ценопад"
+    r"|выбор\s+покупателей?"
+    r"|[-−+]\d+\s*%"
+    r")(?=\s|$)",
+)
+
+
+def is_product_name_noise(text: str | None) -> bool:
+    """True for promo/stock/delivery badges mistaken for a product title."""
+    if not text:
+        return True
+    value = " ".join(str(text).split()).strip(" ·•|-–—")
+    if not value:
+        return True
+    if len(value) < 3:
+        return True
+    if re.search(r"\d[\d\s\u2009]*\s*₽", value):
+        return True
+    if has_bonus_text(value):
+        return True
+    if _PRODUCT_NAME_NOISE_FULL.match(value):
+        return True
+    # Mostly digits / punctuation, no real words.
+    letters = re.findall(r"[A-Za-zА-Яа-яЁё]", value)
+    if len(letters) < 3 and not re.search(r"[A-Za-zА-Яа-яЁё]{4,}", value):
+        return True
+    return False
+
+
+def clean_product_name(text: str | None) -> str:
+    """Strip listing badges glued into a title (e.g. «… 1 шт распродажа»)."""
+    if not text:
+        return ""
+    value = str(text).replace("\xa0", " ").replace("\u2009", " ")
+    value = re.sub(r"<[^>]+>", " ", value)
+    value = " ".join(value.split()).strip(" ·•|-–—")
+    if not value:
+        return ""
+    # Repeated passes remove stacked badges at the edges.
+    for _ in range(4):
+        cleaned = _PRODUCT_NAME_NOISE_INLINE.sub(" ", value)
+        cleaned = " ".join(cleaned.split()).strip(" ·•|-–—")
+        if cleaned == value:
+            break
+        value = cleaned
+    if is_product_name_noise(value):
+        return ""
+    return value
+
+
+def pick_product_name(*sources: str | None) -> str:
+    """Choose the best product title from card text / HTML / link labels."""
+    candidates: list[str] = []
+    seen: set[str] = set()
+
+    def consider(raw: str | None) -> None:
+        if not raw:
+            return
+        for part in re.split(r"[\n\r\t|]+", str(raw)):
+            cleaned = clean_product_name(part)
+            if not cleaned or cleaned.lower() in seen:
+                continue
+            seen.add(cleaned.lower())
+            candidates.append(cleaned)
+        # Also try the whole blob after cleaning (multi-word titles).
+        whole = clean_product_name(raw)
+        if whole and whole.lower() not in seen:
+            seen.add(whole.lower())
+            candidates.append(whole)
+
+    for source in sources:
+        consider(source)
+
+    if not candidates:
+        return ""
+
+    def score(name: str) -> tuple[int, int, int]:
+        words = len(name.split())
+        letters = len(re.findall(r"[A-Za-zА-Яа-яЁё]", name))
+        # Prefer real titles: longer, more words/letters, not badge-like.
+        return (letters, words, len(name))
+
+    return max(candidates, key=score)
 
 
 def price_diff(original: float, discounted: float) -> tuple[float, float]:

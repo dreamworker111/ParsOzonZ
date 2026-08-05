@@ -21,8 +21,14 @@ class ParseCheckpoint:
     products: list[ProductRow]
 
 
-def target_key(target) -> str:
+def target_key(target, seller_scope: str = "") -> str:
+    scope = str(
+        seller_scope
+        or getattr(target, "seller_scope", "")
+        or ""
+    ).strip()
     parts = (
+        scope,
         str(getattr(target, "id", "") or ""),
         str(getattr(target, "category_id", "") or ""),
         str(getattr(target, "param_key", "") or ""),
@@ -38,11 +44,13 @@ def settings_signature(settings) -> str:
     targets = sorted({target_key(target) for target in (settings.categories or [])})
     payload = {
         "seller_url": settings.seller_url,
+        "parse_mode": settings.parse_mode,
         "specific_seller": settings.specific_seller,
         "browser_mode": settings.browser_mode,
         "min_price": settings.min_price,
         "max_price": settings.max_price,
         "max_products": settings.max_products,
+        "bonus_only": bool(getattr(settings, "bonus_only", True)),
         "targets": targets,
     }
     encoded = json.dumps(

@@ -83,8 +83,9 @@ class GuiModeSmokeTests(unittest.TestCase):
             self.assertEqual(window.help_btn.text(), "Инструкция")
             self.assertTrue(callable(window._show_instructions))
             text = build_user_instructions().lower()
-            self.assertIn("открыть chrome", text)
+            self.assertIn("chrome", text)
             self.assertIn("загрузить категории", text)
+            self.assertIn("загрузить подкатегории", text)
             self.assertIn("parse_checkpoint", text)
             self.assertIn("большой объём", text)
         finally:
@@ -116,23 +117,86 @@ class GuiModeSmokeTests(unittest.TestCase):
         self.assertEqual(target.category_id, "123")
         self.assertEqual(target.url, "https://www.ozon.ru/category/123/")
 
-    def test_specific_seller_checkbox_controls_link_input(self):
+    def test_category_tree_shows_hierarchy_affiliation(self):
+        tree = FilterTreeWidget()
+        leaf = FilterOptionNode(
+            id="leaf",
+            name="Android",
+            url="https://www.ozon.ru/category/3/",
+            param_key="category",
+            param_value="3",
+            category_id="3",
+            category_name="Android",
+            parent_name="Смартфоны",
+        )
+        mid = FilterOptionNode(
+            id="mid",
+            name="Смартфоны",
+            url="https://www.ozon.ru/category/2/",
+            param_key="category",
+            param_value="2",
+            category_id="2",
+            category_name="Смартфоны",
+            parent_name="Электроника",
+            children=[leaf],
+        )
+        root = FilterOptionNode(
+            id="root",
+            name="Электроника",
+            url="https://www.ozon.ru/category/1/",
+            param_key="category",
+            param_value="1",
+            category_id="1",
+            category_name="Электроника",
+            children=[mid],
+        )
+        tree.populate_categories([root])
+
+        root_item = tree.topLevelItem(0)
+        mid_item = root_item.child(0)
+        leaf_item = mid_item.child(0)
+
+        self.assertEqual(root_item.text(0), "Электроника  (1)")
+        self.assertTrue(root_item.text(0).startswith("Электроника"))
+        self.assertIn("Смартфоны", mid_item.text(0))
+        self.assertIn("(1)", mid_item.text(0))
+        self.assertIn("Android", leaf_item.text(0))
+        self.assertIn("Смартфоны", leaf_item.text(0))
+        self.assertEqual(
+            leaf_item.data(0, tree.ROLE_FULL_PATH),
+            "Электроника → Смартфоны → Android",
+        )
+
+        leaf_item.setCheckState(0, Qt.CheckState.Checked)
+        target = tree.selected_leaf_categories()[0]
+        self.assertEqual(target.name, "Электроника → Смартфоны → Android")
+        self.assertEqual(target.parent_name, "Смартфоны")
+
+    def test_parse_mode_combo_controls_link_input(self):
+        from ozon_parser.config import PARSE_MODE_GLOBAL_CATEGORIES, PARSE_MODE_SELLER_FULL
+
         window = MainWindow()
         try:
-            self.assertFalse(window.specific_seller_checkbox.isChecked())
+            self.assertEqual(window._selected_parse_mode(), PARSE_MODE_GLOBAL_CATEGORIES)
             self.assertFalse(window.seller_input.isEnabled())
             self.assertEqual(window.seller_input.text(), "")
             self.assertEqual(window.max_products.maximum(), 100000)
 
-            window.specific_seller_checkbox.setChecked(True)
+            for index in range(window.parse_mode_combo.count()):
+                if window.parse_mode_combo.itemData(index) == PARSE_MODE_SELLER_FULL:
+                    window.parse_mode_combo.setCurrentIndex(index)
+                    break
             self.app.processEvents()
             self.assertTrue(window.seller_input.isEnabled())
             self.assertIn("/seller/", window.seller_input.placeholderText())
 
-            window.specific_seller_checkbox.setChecked(False)
+            for index in range(window.parse_mode_combo.count()):
+                if window.parse_mode_combo.itemData(index) == PARSE_MODE_GLOBAL_CATEGORIES:
+                    window.parse_mode_combo.setCurrentIndex(index)
+                    break
             self.app.processEvents()
             self.assertFalse(window.seller_input.isEnabled())
-            self.assertIn("всех продавцов", window.seller_input.placeholderText())
+            self.assertIn("общий каталог", window.seller_input.placeholderText().lower())
         finally:
             window.close()
 
@@ -186,6 +250,60 @@ class BonusOnlyParsingTests(unittest.TestCase):
         self.assertIsNotNone(product)
         self.assertEqual(product.bonus_points, 150)
         self.assertEqual(product.name, "Товар с баллами")
+
+    def test_process_card_keeps_ruble_bonus_format(self):
+        from ozon_parser.parser import OzonParser, ParseSettings, _ParseState
+
+        parser = OzonParser()
+        settings = ParseSettings(
+            seller_url="",
+            categories=[],
+            min_price=None,
+            max_price=None,
+            max_products=100,
+            use_auth=False,
+            import_browser_session=False,
+        )
+        state = _ParseState()
+        card = {
+            "href": "https://www.ozon.ru/product/item-3/",
+            "name": "Товар с рублями",
+            "text": "Товар с рублями\n2 500 ₽\n200 ₽ за отзыв",
+            "html": "<div>200 ₽ за отзыв</div>",
+        }
+
+        product = parser._process_card(card, settings, state)
+        self.assertIsNotNone(product)
+        self.assertEqual(product.bonus_points, 200)
+        self.assertEqual(product.name, "Товар с рублями")
+
+    def test_process_card_keeps_all_products_when_bonus_filter_off(self):
+        from ozon_parser.parser import OzonParser, ParseSettings, _ParseState
+
+        parser = OzonParser()
+        settings = ParseSettings(
+            seller_url="",
+            categories=[],
+            min_price=None,
+            max_price=None,
+            max_products=100,
+            use_auth=False,
+            import_browser_session=False,
+            bonus_only=False,
+        )
+        state = _ParseState()
+        card = {
+            "href": "https://www.ozon.ru/product/item-4/",
+            "name": "Обычный товар",
+            "text": "Обычный товар\n900 ₽",
+            "html": "<div>Обычный товар 900 ₽</div>",
+        }
+
+        product = parser._process_card(card, settings, state)
+        self.assertIsNotNone(product)
+        self.assertEqual(product.bonus_points, 0)
+        self.assertEqual(product.name, "Обычный товар")
+        self.assertEqual(product.price_discounted, 900.0)
 
 
 class MobileLoginFlowTests(unittest.TestCase):

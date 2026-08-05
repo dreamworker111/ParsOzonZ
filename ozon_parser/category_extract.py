@@ -2,7 +2,20 @@ import json
 import re
 from typing import Any
 
-SKIP_NAMES = {"ещё", "еще", "все", "all", "показать все", "свернуть", "развернуть"}
+SKIP_NAMES = {
+    "ещё",
+    "еще",
+    "все",
+    "all",
+    "показать все",
+    "посмотреть все",
+    "смотреть все",
+    "показать ещё",
+    "показать еще",
+    "все категории",
+    "свернуть",
+    "развернуть",
+}
 
 # i18n / internal keys that are not real category names
 INVALID_NAME_RE = re.compile(

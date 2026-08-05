@@ -7,7 +7,7 @@ from ozon_parser import chrome_launcher
 
 
 class ChromeLauncherTests(unittest.TestCase):
-    def test_chrome_opens_all_sellers_page(self):
+    def test_chrome_opens_ozon_home_page(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             with (
                 patch.object(
@@ -25,7 +25,8 @@ class ChromeLauncherTests(unittest.TestCase):
                 self.assertTrue(chrome_launcher.launch_chrome_for_ozon())
 
         command = popen.call_args.args[0]
-        self.assertEqual(command[-1], "https://www.ozon.ru/seller/")
+        self.assertEqual(command[-1], "https://www.ozon.ru/")
+        self.assertEqual(chrome_launcher.OZON_START_URL, "https://www.ozon.ru/")
 
 
 if __name__ == "__main__":

@@ -4,9 +4,9 @@ import time
 import urllib.request
 from pathlib import Path
 
-from .config import ALL_SELLERS_PATH, CDP_URL, CHROME_DEBUG_PORT, CHROME_OZON_PROFILE, DESKTOP_BASE_URL
+from .config import CDP_URL, CHROME_DEBUG_PORT, CHROME_OZON_PROFILE, DESKTOP_BASE_URL
 
-OZON_START_URL = DESKTOP_BASE_URL.rstrip("/") + ALL_SELLERS_PATH
+OZON_START_URL = DESKTOP_BASE_URL.rstrip("/") + "/"
 
 
 def find_chrome_exe() -> Path | None:

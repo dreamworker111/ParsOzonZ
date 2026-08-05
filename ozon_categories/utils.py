@@ -24,7 +24,20 @@ R = TypeVar("R")
 
 logger = logging.getLogger(__name__)
 
-SKIP_NAMES = frozenset({"ещё", "eще", "еще", "все", "all", "показать все", "свернуть", "развернуть"})
+SKIP_NAMES = frozenset({
+    "ещё",
+    "eще",
+    "еще",
+    "все",
+    "all",
+    "показать все",
+    "посмотреть все",
+    "смотреть все",
+    "показать ещё",
+    "показать еще",
+    "свернуть",
+    "развернуть",
+})
 INVALID_NAME_RE = re.compile(
     r"(^|[.\s])(profile|widget|web[A-Z]|myProfile|layout|state|config|token|session)([.\s]|$)",
     re.I,

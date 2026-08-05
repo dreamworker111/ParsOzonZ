@@ -1,8 +1,9 @@
+import json
 import re
 import random
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Callable
 from urllib.parse import urlencode, urlparse, urlunparse
 
@@ -15,33 +16,48 @@ from .browser import (
     is_access_restricted,
     is_blocked_page,
     is_captcha_page,
+    is_empty_catalog_filter_page,
     is_seller_page,
     open_session_context,
-    page_has_usable_ozon_content,
     recover_access,
     safe_goto,
+    try_reset_catalog_filters,
     wait_for_ozon_ready,
 )
 from .categories import CategoryLoader, CategoryTarget
+from .seller_discovery import discover_marketplace_sellers
+from .composer_products import extract_product_cards_from_composer
 from .parse_stats import ParseStats, ParseStatus, ParseTimer, SectionTiming, format_duration
 from .config import (
     ALL_SELLERS_PATH,
+    BLOCK_AUTO_WAIT_MAX_ATTEMPTS,
     BLOCK_AUTO_WAIT_POLL_SEC,
     BLOCK_AUTO_WAIT_SEC,
+    BLOCK_POST_CLEAR_COOLDOWN_MAX,
+    BLOCK_POST_CLEAR_COOLDOWN_MIN,
     BrowserMode,
+    CATEGORY_REQUIRED_PARSE_MODES,
     CHECKPOINT_SAVE_EVERY_PRODUCTS,
     DESKTOP_MODE,
     GLOBAL_CATALOG_PATH,
     GLOBAL_FIRST_CATEGORY_PAUSE_MAX,
     GLOBAL_FIRST_CATEGORY_PAUSE_MIN,
     GLOBAL_LARGE_SELECTION_THRESHOLD,
+    GLOBAL_PARSE_MODES,
     GLOBAL_SESSION_MAX_CATEGORIES,
     GLOBAL_SESSION_MAX_PRODUCTS,
     GLOBAL_WAVE_COOLDOWN_MAX,
     GLOBAL_WAVE_COOLDOWN_MIN,
     MAX_CATEGORY_RETRIES,
+    MAX_MARKETPLACE_SELLERS,
     MAX_PRODUCT_DETAIL_FETCHES,
     MOBILE_MODE,
+    PARSE_MODE_ALL_SELLERS_CATEGORIES,
+    PARSE_MODE_ALL_SELLERS_FULL,
+    PARSE_MODE_GLOBAL_CATEGORIES,
+    PARSE_MODE_SELLER_CATEGORIES,
+    PARSE_MODE_SELLER_FULL,
+    ParseMode,
     PRODUCT_BATCH_PAUSE_MAX,
     PRODUCT_BATCH_PAUSE_MIN,
     PRODUCT_BATCH_SIZE,
@@ -69,6 +85,7 @@ from .parse_checkpoint import (
 )
 from .session import resolve_storage_state
 from .utils import (
+    extract_ozon_product_id,
     has_bonus_text,
     human_category_delay,
     human_click_delay,
@@ -77,9 +94,11 @@ from .utils import (
     normalize_seller_url,
     parse_bonus_points,
     parse_price,
+    pick_product_name,
     to_desktop_product_url,
     to_browser_url,
     route_browser_url,
+    sanitize_catalog_url,
     with_price_sort_asc,
 )
 
@@ -95,13 +114,27 @@ class ParseSettings:
     import_browser_session: bool
     use_cdp: bool = True
     browser_mode: BrowserMode = DESKTOP_MODE
-    specific_seller: bool = True
+    parse_mode: ParseMode = PARSE_MODE_SELLER_CATEGORIES
+    bonus_only: bool = True
+
+    @property
+    def specific_seller(self) -> bool:
+        return self.parse_mode in (PARSE_MODE_SELLER_FULL, PARSE_MODE_SELLER_CATEGORIES)
+
+    @property
+    def uses_global_catalog(self) -> bool:
+        return self.parse_mode in GLOBAL_PARSE_MODES
+
+    @property
+    def requires_category_selection(self) -> bool:
+        return self.parse_mode in CATEGORY_REQUIRED_PARSE_MODES
 
 
 @dataclass
 class _ParseState:
     detail_fetches: int = 0
     seen_urls: set[str] = field(default_factory=set)
+    seen_product_ids: set[str] = field(default_factory=set)
 
 
 class OzonParser:
@@ -151,7 +184,7 @@ class OzonParser:
     def _wave_budgets(self, settings: ParseSettings) -> tuple[int, int]:
         """Soft wave sizes: auto-cooldown then continue in the same run."""
         category_count = len(settings.categories or [])
-        if not settings.specific_seller:
+        if settings.uses_global_catalog:
             cats = GLOBAL_SESSION_MAX_CATEGORIES
             products = GLOBAL_SESSION_MAX_PRODUCTS
             if category_count >= GLOBAL_LARGE_SELECTION_THRESHOLD:
@@ -169,7 +202,7 @@ class OzonParser:
         return self._wave_budgets(settings)
 
     def _wave_cooldown_range(self, settings: ParseSettings) -> tuple[float, float]:
-        if not settings.specific_seller:
+        if settings.uses_global_catalog:
             return GLOBAL_WAVE_COOLDOWN_MIN, GLOBAL_WAVE_COOLDOWN_MAX
         return WAVE_COOLDOWN_MIN, WAVE_COOLDOWN_MAX
 
@@ -206,59 +239,80 @@ class OzonParser:
             return ok
         return True
 
-    def _wait_out_access_block(self, settings: ParseSettings) -> bool:
-        """Passive wait for fab_/connection page to clear without reloading."""
-        if self._block_auto_waits_used >= 3:
+    def _park_blocked_tab(self) -> None:
+        """Stop Ozon SPA polling on a fab_ page (no F5 — that prolongs the block)."""
+        if not self._page:
+            return
+        try:
+            current = str(getattr(self._page, "url", "") or "")
+        except Exception:
+            current = ""
+        if not current or current.startswith("about:"):
+            return
+        self.on_progress("Останавливаем активность вкладки (about:blank), без F5...")
+        try:
+            self._page.goto("about:blank", wait_until="domcontentloaded", timeout=15000)
+        except Exception as exc:
+            self.on_progress(f"Не удалось увести вкладку: {exc}")
+
+    def _wait_out_access_block(
+        self,
+        settings: ParseSettings,
+        *,
+        reopen_url: str | None = None,
+    ) -> bool:
+        """Park tab, wait passively, then probe Ozon — never reload a fab_ page."""
+        if self._block_auto_waits_used >= BLOCK_AUTO_WAIT_MAX_ATTEMPTS:
             self.on_progress(
                 "Лимит автоожиданий блокировки исчерпан. "
                 "Прогресс сохранён — продолжите позже."
             )
             return False
         self._block_auto_waits_used += 1
-        deadline = time.time() + BLOCK_AUTO_WAIT_SEC
-        minutes = int(BLOCK_AUTO_WAIT_SEC // 60)
+        wait_sec = int(BLOCK_AUTO_WAIT_SEC)
+        incident = None
+        if self._page:
+            try:
+                incident = extract_incident_id(self._page)
+            except Exception:
+                incident = None
         self.on_progress(
-            f"Ozon ограничил доступ — автоожидание до {minutes} мин без F5 "
-            f"(попытка {self._block_auto_waits_used}/3)..."
+            "Ozon ограничил доступ (fab_/«нет соединения») — "
+            f"автоожидание до {wait_sec} сек без F5 "
+            f"(попытка {self._block_auto_waits_used}/{BLOCK_AUTO_WAIT_MAX_ATTEMPTS})"
+            + (f", инцидент {incident}" if incident else "")
+            + "..."
         )
-        soft_reload_done = False
+        # about:blank stops Composer/SPA retries that keep the incident alive.
+        self._park_blocked_tab()
+
+        deadline = time.time() + BLOCK_AUTO_WAIT_SEC
         while time.time() < deadline and not self.is_stopped():
-            if self._page and not is_access_restricted(self._page):
-                if page_has_usable_ozon_content(self._page) or wait_for_ozon_ready(
-                    self._page, self.on_progress, timeout_sec=30
-                ):
-                    self.on_progress("Доступ восстановлен — продолжаем сбор")
-                    return True
-            # After a long passive wait, a single reload helps when the
-            # «нет соединения» shell sticks without a fresh fab_ id.
-            waited = BLOCK_AUTO_WAIT_SEC - max(0, deadline - time.time())
-            if (
-                self._page
-                and not soft_reload_done
-                and waited >= 600
-                and not extract_incident_id(self._page)
-            ):
-                soft_reload_done = True
-                self.on_progress(
-                    "Одно мягкое обновление после 10 мин ожидания "
-                    "(без fab_ id)..."
-                )
-                try:
-                    self._page.reload(wait_until="domcontentloaded", timeout=90000)
-                    human_delay(3.0, 5.0)
-                except Exception as exc:
-                    self.on_progress(f"Мягкое обновление не удалось: {exc}")
+            # Do not treat about:blank as «доступ восстановлен».
             remaining = int(max(0, deadline - time.time()))
-            self.on_progress(
-                f"Ждём снятия блокировки… осталось ~{remaining // 60} мин "
-                f"{remaining % 60} сек"
-            )
+            self.on_progress(f"Ждём снятия блокировки… осталось ~{remaining} сек")
             if self._stop_event.wait(BLOCK_AUTO_WAIT_POLL_SEC):
                 return False
-        if self._page and not is_access_restricted(self._page):
-            return True
-        self.on_progress("Блокировка не снялась за отведённое время")
-        return False
+        if self.is_stopped():
+            return False
+
+        probe = reopen_url or "https://www.ozon.ru/"
+        self.on_progress("Проверяем доступ после ожидания...")
+        if not self._page:
+            return False
+        opened = safe_goto(
+            self._page,
+            probe,
+            self.on_progress,
+            max_retries=1,
+            on_manual_bypass=self.on_manual_bypass,
+        )
+        if not opened or is_access_restricted(self._page):
+            self.on_progress("Блокировка не снялась за отведённое время")
+            return False
+        human_delay(BLOCK_POST_CLEAR_COOLDOWN_MIN, BLOCK_POST_CLEAR_COOLDOWN_MAX)
+        self.on_progress("Доступ восстановлен — продолжаем сбор")
+        return True
 
     def _maybe_start_next_wave(
         self,
@@ -397,6 +451,11 @@ class OzonParser:
             state.seen_urls = {
                 self._canonical_product_url(product.url) for product in products
             }
+            state.seen_product_ids = {
+                pid
+                for product in products
+                if (pid := extract_ozon_product_id(product.url))
+            }
             self._run_products_found = len(products)
             self._since_mega_pause = len(products) % PRODUCT_MEGA_BATCH_SIZE
             self.on_progress(
@@ -406,23 +465,19 @@ class OzonParser:
 
         products_at_run_start = len(products)
         category_count = len(settings.categories or [])
-        mode_hint = (
-            "общий каталог (все магазины)"
-            if not settings.specific_seller
-            else "конкретный магазин"
-        )
+        mode_hint = self._parse_mode_label(settings.parse_mode)
         self.on_progress(
             f"Непрерывный безопасный режим ({mode_hint}): карточки каталога, "
-            f"без открытия страниц товаров. Цель: {settings.max_products} товаров, "
+            f"без открытия страниц товаров. До {settings.max_products} товаров на категорию, "
             f"категорий: {category_count}. "
+            f"{'Только с баллами за отзыв. ' if settings.bonus_only else 'Все товары (включая без баллов). '}"
             f"Автопаузы каждые {PRODUCT_BATCH_SIZE} товаров и после волны "
             f"({wave_cats_budget} кат. / +{wave_products_budget} тов.)."
         )
-        if not settings.specific_seller:
+        if settings.parse_mode == PARSE_MODE_GLOBAL_CATEGORIES:
             self.on_progress(
-                "Общий каталог: как у магазина — каждая выбранная категория/подкатегория "
-                "открывается по очереди (/seller/0/?category=…), скролл карточек в DOM, "
-                "человеческие паузы между ветками (без Composer-сбора товаров)."
+                "Общий каталог: каждая выбранная категория открывается как "
+                "/seller/0/?category=… без привязки к конкретному магазину."
             )
         if settings.max_products >= 1000:
             self.on_progress(
@@ -430,7 +485,7 @@ class OzonParser:
                 "разбан без перезагрузки. Не жмите F5 в Chrome."
             )
         if (
-            not settings.specific_seller
+            settings.parse_mode == PARSE_MODE_GLOBAL_CATEGORIES
             and category_count >= GLOBAL_LARGE_SELECTION_THRESHOLD
         ):
             self.on_progress(
@@ -465,8 +520,8 @@ class OzonParser:
                     )
                 )
                 categories = settings.categories or []
-                if not categories:
-                    self.on_progress("Фильтры не выбраны — парсинг остановлен")
+                if settings.requires_category_selection and not categories:
+                    self.on_progress("Категории не выбраны — парсинг остановлен")
                     return products, stats
 
                 if not ensure_ozon_session_ready(
@@ -485,7 +540,7 @@ class OzonParser:
 
                 # After a heavy catalogue crawl the next hop is the most ban-prone.
                 # Stay on the current tab and cool down before the first category URL.
-                if not settings.specific_seller:
+                if settings.parse_mode == PARSE_MODE_GLOBAL_CATEGORIES:
                     self.on_progress(
                         "Пауза перед парсингом общего каталога "
                         f"({int(GLOBAL_FIRST_CATEGORY_PAUSE_MIN)}–"
@@ -499,7 +554,9 @@ class OzonParser:
                         self.on_progress(
                             "После паузы доступ всё ещё ограничен — ждём разбан..."
                         )
-                        if not self._wait_out_access_block(settings):
+                        if not self._wait_out_access_block(
+                            settings, reopen_url=seller_url
+                        ):
                             self._persist_progress(settings, completed_targets, products)
                             stats.total_duration_sec = timer.total_elapsed
                             return products, stats
@@ -545,211 +602,231 @@ class OzonParser:
                         stats.total_duration_sec = timer.total_elapsed
                         return products, stats
 
-                total = len(categories)
+                parse_jobs = self._build_parse_jobs(settings, categories, self._page)
+                if not parse_jobs:
+                    self.on_progress("Нет задач для парсинга — проверьте режим и выбор категорий")
+                    return products, stats
+
+                total = sum(len(job_cats) for _job_seller, job_cats in parse_jobs)
                 timer.reset()
                 interrupted = False
-                goal_reached = len(products) >= settings.max_products
                 access_stopped = False
+                idx = 0
 
-                for idx, target in enumerate(categories, start=1):
-                    if goal_reached or access_stopped:
+                for job_seller_url, job_categories in parse_jobs:
+                    if access_stopped or self.is_stopped():
                         break
-                    if self.is_stopped():
-                        interrupted = True
-                        break
+                    active_seller = job_seller_url or seller_url
+                    if job_seller_url:
+                        self.on_progress(f"Магазин: {job_seller_url}")
+                        if not safe_goto(
+                            self._page,
+                            job_seller_url,
+                            self.on_progress,
+                            max_retries=SAFE_GOTO_MAX_RETRIES,
+                            on_manual_bypass=self.on_manual_bypass,
+                        ):
+                            self.on_progress(
+                                f"Пропуск магазина (не открылся): {job_seller_url}"
+                            )
+                            continue
 
-                    key = target_key(target)
-                    if key in completed_targets:
-                        self.on_progress(
-                            f"Пропуск завершённой категории {idx}/{total}: "
-                            f"{target.name or target.id}"
-                        )
-                        continue
-
-                    cont, wave_cats, wave_products_gained = self._maybe_start_next_wave(
-                        settings,
-                        wave_cats=wave_cats,
-                        wave_products_gained=wave_products_gained,
-                        wave_cats_budget=wave_cats_budget,
-                        wave_products_budget=wave_products_budget,
-                        total_products=len(products),
-                        goal=settings.max_products,
-                    )
-                    if not cont:
-                        interrupted = True
-                        break
-
-                    if not self._pause_before_category(settings, categories_opened):
-                        interrupted = True
-                        break
-
-                    if is_access_restricted(self._page):
-                        self.on_progress(
-                            "Обнаружен fab_/блокировка перед открытием категории."
-                        )
-                        self._persist_progress(settings, completed_targets, products)
-                        if self._wait_out_access_block(settings):
-                            if is_access_restricted(self._page):
-                                access_stopped = True
-                                interrupted = True
-                                break
-                        else:
-                            access_stopped = True
+                    for target in job_categories:
+                        idx += 1
+                        if access_stopped:
+                            break
+                        if self.is_stopped():
                             interrupted = True
                             break
 
-                    section, category_label, item_label = self._target_labels(target)
-                    timer.restart_section()
-                    self._parse_timer_ref = timer
-                    self._parse_index = idx
-                    self._parse_total = total
-                    self.on_progress(
-                        f"Категория {idx}/{total} по очереди: "
-                        f"{category_label or item_label or target.name or target.id}"
-                    )
-                    self._emit_status(timer, idx, total, section, category_label, item_label)
+                        key = target_key(target, job_seller_url)
+                        if key in completed_targets:
+                            self.on_progress(
+                                f"Пропуск завершённой категории {idx}/{total}: "
+                                f"{target.name or target.id}"
+                            )
+                            continue
 
-                    if settings.specific_seller:
-                        catalog_url = target.url or self._build_catalog_url(
-                            seller_url,
-                            target.param_key,
-                            target.param_value,
-                            settings.browser_mode,
+                        cont, wave_cats, wave_products_gained = self._maybe_start_next_wave(
+                            settings,
+                            wave_cats=wave_cats,
+                            wave_products_gained=wave_products_gained,
+                            wave_cats_budget=wave_cats_budget,
+                            wave_products_budget=wave_products_budget,
+                            total_products=len(products),
+                            goal=settings.max_products,
                         )
-                    else:
-                        catalog_url = self._build_global_catalog_url(
-                            target,
-                            settings.browser_mode,
-                        )
+                        if not cont:
+                            interrupted = True
+                            break
 
-                    def on_batch_progress(batch_products: list[ProductRow]) -> None:
-                        nonlocal products
-                        combined = self._dedupe_products(products + batch_products)
-                        self._persist_progress(settings, completed_targets, combined)
+                        if not self._pause_before_category(settings, categories_opened):
+                            interrupted = True
+                            break
 
-                    remaining_goal = max(0, settings.max_products - len(products))
-                    if remaining_goal <= 0:
-                        goal_reached = True
-                        break
-
-                    before_count = len(products)
-                    batch, category_completed = self._parse_catalog_with_retry(
-                        catalog_url,
-                        settings,
-                        state,
-                        target,
-                        product_cap=remaining_goal,
-                        on_progress_save=on_batch_progress,
-                    )
-                    products.extend(batch)
-                    products = self._persist_progress(
-                        settings,
-                        completed_targets,
-                        products,
-                    )
-                    gained = max(0, len(products) - before_count)
-                    wave_products_gained += gained
-                    wave_cats += 1
-                    categories_opened += 1
-
-                    if category_completed:
-                        completed_targets.add(key)
-                        self._persist_progress(settings, completed_targets, products)
-                    elif self._page and is_access_restricted(self._page):
-                        self._persist_progress(settings, completed_targets, products)
-                        if self._wait_out_access_block(settings):
-                            # Retry the same incomplete category after unban.
-                            if not self._pause_before_category(settings, categories_opened):
+                        if is_access_restricted(self._page):
+                            self.on_progress(
+                                "Обнаружен fab_/блокировка перед открытием категории."
+                            )
+                            self._persist_progress(settings, completed_targets, products)
+                            if self._wait_out_access_block(
+                                settings,
+                                reopen_url=active_seller or "https://www.ozon.ru/",
+                            ):
+                                if is_access_restricted(self._page):
+                                    access_stopped = True
+                                    interrupted = True
+                                    break
+                            else:
+                                access_stopped = True
                                 interrupted = True
                                 break
-                            retry_batch, category_completed = self._parse_catalog_with_retry(
-                                catalog_url,
-                                settings,
-                                state,
+
+                        section, category_label, item_label = self._target_labels(target)
+                        timer.restart_section()
+                        self._parse_timer_ref = timer
+                        self._parse_index = idx
+                        self._parse_total = total
+                        self.on_progress(
+                            f"Категория {idx}/{total} по очереди: "
+                            f"{category_label or item_label or target.name or target.id}"
+                        )
+                        self._emit_status(timer, idx, total, section, category_label, item_label)
+
+                        if settings.parse_mode == PARSE_MODE_GLOBAL_CATEGORIES:
+                            catalog_url = self._build_global_catalog_url(
                                 target,
-                                product_cap=max(
-                                    0, settings.max_products - len(products)
-                                ),
-                                on_progress_save=on_batch_progress,
+                                settings.browser_mode,
                             )
-                            if retry_batch:
-                                products.extend(retry_batch)
-                                products = self._persist_progress(
-                                    settings, completed_targets, products
+                        else:
+                            catalog_url = self._catalog_url_for_target(
+                                active_seller,
+                                target,
+                                settings,
+                            )
+
+                        def on_batch_progress(batch_products: list[ProductRow]) -> None:
+                            nonlocal products
+                            combined = self._dedupe_products(products + batch_products)
+                            self._persist_progress(settings, completed_targets, combined)
+
+                        per_category_cap = settings.max_products
+
+                        before_count = len(products)
+                        batch, category_completed = self._parse_catalog_with_retry(
+                            catalog_url,
+                            settings,
+                            state,
+                            target,
+                            product_cap=per_category_cap,
+                            on_progress_save=on_batch_progress,
+                            specific_seller=bool(job_seller_url) or settings.specific_seller,
+                        )
+                        products.extend(batch)
+                        products = self._persist_progress(
+                            settings,
+                            completed_targets,
+                            products,
+                        )
+                        gained = max(0, len(products) - before_count)
+                        wave_products_gained += gained
+                        wave_cats += 1
+                        categories_opened += 1
+
+                        if category_completed:
+                            completed_targets.add(key)
+                            self._persist_progress(settings, completed_targets, products)
+                        elif self._page and is_access_restricted(self._page):
+                            self._persist_progress(settings, completed_targets, products)
+                            if self._wait_out_access_block(
+                                settings, reopen_url=catalog_url
+                            ):
+                                if not self._pause_before_category(settings, categories_opened):
+                                    interrupted = True
+                                    break
+                                retry_batch, category_completed = self._parse_catalog_with_retry(
+                                    catalog_url,
+                                    settings,
+                                    state,
+                                    target,
+                                    product_cap=settings.max_products,
+                                    on_progress_save=on_batch_progress,
+                                    specific_seller=bool(job_seller_url) or settings.specific_seller,
                                 )
-                                gained = len(retry_batch)
-                                wave_products_gained += gained
-                                batch = list(batch) + list(retry_batch)
-                            if category_completed:
-                                completed_targets.add(key)
-                                self._persist_progress(
-                                    settings, completed_targets, products
-                                )
-                            elif self._page and is_access_restricted(self._page):
+                                if retry_batch:
+                                    products.extend(retry_batch)
+                                    products = self._persist_progress(
+                                        settings, completed_targets, products
+                                    )
+                                    gained = len(retry_batch)
+                                    wave_products_gained += gained
+                                    batch = list(batch) + list(retry_batch)
+                                if category_completed:
+                                    completed_targets.add(key)
+                                    self._persist_progress(
+                                        settings, completed_targets, products
+                                    )
+                                elif self._page and is_access_restricted(self._page):
+                                    interrupted = True
+                                    access_stopped = True
+                                else:
+                                    interrupted = not category_completed
+                            else:
                                 interrupted = True
                                 access_stopped = True
-                            else:
-                                interrupted = not category_completed
                         else:
-                            interrupted = True
-                            access_stopped = True
-                    else:
-                        interrupted = not category_completed
+                            interrupted = not category_completed
 
-                    duration = timer.section_elapsed
-                    stats.section_timings.append(
-                        SectionTiming(
-                            section=section,
-                            category=category_label,
-                            name=item_label,
-                            index=idx,
-                            total=total,
-                            duration_sec=duration,
-                            products_found=len(batch),
-                        )
-                    )
-                    self.on_progress(
-                        f"Готово {idx}/{total}: {section} — {item_label} | "
-                        f"{len(batch)} тов. за {format_duration(duration)} | "
-                        f"всего собрано {len(products)}/{settings.max_products}"
-                    )
-                    self._emit_status(
-                        timer, idx, total, section, category_label, item_label,
-                        message=f"Завершено: {len(batch)} товаров",
-                    )
-                    if access_stopped:
-                        self.on_progress(
-                            "Сбор приостановлен из‑за блокировки. Прогресс сохранён; "
-                            "после разбана запустите снова с теми же категориями."
-                        )
-                        break
-                    if len(products) >= settings.max_products:
-                        goal_reached = True
-                        interrupted = False
-                        self.on_progress(
-                            f"Достигнут общий лимит: {settings.max_products} товаров"
-                        )
-                        break
-                    if interrupted and not category_completed:
-                        if self.is_stopped():
-                            self.on_progress("Остановлено пользователем. Прогресс сохранён.")
-                        else:
-                            self.on_progress(
-                                "Категория не завершена. Прогресс сохранён; "
-                                "повторный запуск продолжит сбор."
+                        duration = timer.section_elapsed
+                        stats.section_timings.append(
+                            SectionTiming(
+                                section=section,
+                                category=category_label,
+                                name=item_label,
+                                index=idx,
+                                total=total,
+                                duration_sec=duration,
+                                products_found=len(batch),
                             )
-                        break
+                        )
+                        self.on_progress(
+                            f"Готово {idx}/{total}: {section} — {item_label} | "
+                            f"{len(batch)} тов. за {format_duration(duration)} | "
+                            f"всего собрано {len(products)}"
+                        )
+                        self._emit_status(
+                            timer, idx, total, section, category_label, item_label,
+                            message=f"Завершено: {len(batch)} товаров",
+                        )
+                        if access_stopped:
+                            self.on_progress(
+                                "Сбор приостановлен из‑за блокировки. Прогресс сохранён; "
+                                "после разбана запустите снова с теми же категориями."
+                            )
+                            break
+                        if interrupted and not category_completed:
+                            if self.is_stopped():
+                                self.on_progress("Остановлено пользователем. Прогресс сохранён.")
+                                break
+                            self.on_progress(
+                                f"Категория не завершена ({item_label}). "
+                                "Переходим к следующей; при повторном запуске попробуем снова."
+                            )
+                            interrupted = True
+                            continue
 
-                all_target_keys = {target_key(target) for target in categories}
-                if goal_reached or (
-                    not interrupted and all_target_keys.issubset(completed_targets)
-                ):
+                all_target_keys = {
+                    target_key(target, job_seller)
+                    for job_seller, job_cats in parse_jobs
+                    for target in job_cats
+                }
+                if not interrupted and all_target_keys.issubset(completed_targets):
                     clear_checkpoint()
                     self.on_progress("Контрольная точка очищена — сбор завершён")
                 else:
                     self._persist_progress(settings, completed_targets, products)
                     self.on_progress(
-                        f"Прогресс сохранён: {len(products)}/{settings.max_products} товаров. "
+                        f"Прогресс сохранён: {len(products)} товаров. "
                         "При незавершённом сборе запустите парсер снова с теми же категориями."
                     )
             finally:
@@ -762,14 +839,21 @@ class OzonParser:
         return products, stats
 
     def _dedupe_products(self, products: list[ProductRow]) -> list[ProductRow]:
-        seen: set[str] = set()
+        seen_urls: set[str] = set()
+        seen_ids: set[str] = set()
         unique: list[ProductRow] = []
         for product in products:
             canonical_url = self._canonical_product_url(product.url)
-            if canonical_url in seen:
+            product_id = extract_ozon_product_id(canonical_url)
+            if canonical_url and canonical_url in seen_urls:
                 continue
-            seen.add(canonical_url)
-            product.url = canonical_url
+            if product_id and product_id in seen_ids:
+                continue
+            if canonical_url:
+                seen_urls.add(canonical_url)
+            if product_id:
+                seen_ids.add(product_id)
+            product.url = canonical_url or product.url
             unique.append(product)
         return sorted(unique, key=lambda product: product.price_discounted)
 
@@ -816,8 +900,10 @@ class OzonParser:
         on_branch: Callable[[object], None] | None = None,
         specific_seller: bool = True,
         prefer_cache: bool = True,
+        roots_only: bool = False,
     ) -> list:
-        if not specific_seller and prefer_cache:
+        # Full-tree cache only when the caller wants the complete catalogue.
+        if not specific_seller and prefer_cache and not roots_only:
             from .catalog_cache import cache_age_hours, load_global_catalog, save_global_catalog
 
             cached = load_global_catalog()
@@ -857,6 +943,15 @@ class OzonParser:
                     )
                 loader = CategoryLoader(page, browser_mode, session_mode=mode)
                 if specific_seller:
+                    if roots_only:
+                        roots = loader.load_root_categories(
+                            seller_url,
+                            self.on_progress,
+                            self.on_manual_bypass,
+                        )
+                        if on_roots and roots:
+                            on_roots(roots)
+                        return roots
                     return loader.load_category_tree(
                         seller_url,
                         self.on_progress,
@@ -864,6 +959,15 @@ class OzonParser:
                         on_roots=on_roots,
                         on_subcategories_begin=on_subcategories_begin,
                         on_branch=on_branch,
+                    )
+                if roots_only:
+                    self.on_progress(
+                        "Быстрая загрузка главных категорий — без обхода всех веток."
+                    )
+                    return loader.load_global_root_tree(
+                        self.on_progress,
+                        self.on_manual_bypass,
+                        on_roots=on_roots,
                     )
                 self.on_progress(
                     "Медленная загрузка полного каталога (по одной ветке, с паузами) — "
@@ -888,6 +992,94 @@ class OzonParser:
                     except Exception as exc:
                         self.on_progress(f"Не удалось сохранить кэш каталога: {exc}")
                 return categories
+            finally:
+                close_session_context(browser, context, mode)
+
+    def expand_selected_category_subtrees(
+        self,
+        categories: list[CategoryTarget],
+        seller_url: str = "",
+        use_auth: bool = False,
+        use_cdp: bool = True,
+        browser_mode: BrowserMode = DESKTOP_MODE,
+        specific_seller: bool = False,
+        on_subcategories_begin: Callable[[int], None] | None = None,
+        on_branch: Callable[[object], None] | None = None,
+    ) -> list:
+        """Load subcategory trees only for the selected categories."""
+        if not categories:
+            raise ValueError("Не выбраны категории для загрузки подкатегорий.")
+
+        with sync_playwright() as playwright:
+            browser, context, page, mode = self._open_browser(
+                playwright,
+                use_auth=use_auth,
+                use_cdp=use_cdp,
+                browser_mode=browser_mode,
+            )
+            try:
+                if not ensure_ozon_session_ready(
+                    page,
+                    self.on_progress,
+                    on_manual_bypass=self.on_manual_bypass,
+                ):
+                    raise ConnectionError(
+                        "Ozon не готов к загрузке подкатегорий. "
+                        "Дождитесь нормальной загрузки сайта без fab_ и повторите."
+                    )
+                loader = CategoryLoader(page, browser_mode, session_mode=mode)
+                if specific_seller:
+                    if on_subcategories_begin:
+                        on_subcategories_begin(len(categories))
+                    mapping = loader.load_subcategories_for_categories(
+                        seller_url,
+                        categories,
+                        self.on_progress,
+                        self.on_manual_bypass,
+                        on_branch=on_branch,
+                    )
+                    branches: list = []
+                    for target in categories:
+                        cid = str(target.param_value or target.category_id or "")
+                        children = mapping.get(cid) or []
+                        from .filters import FilterOptionNode
+
+                        node = FilterOptionNode(
+                            id=str(target.id or cid),
+                            name=str(target.name or cid),
+                            url=target.url or None,
+                            param_key=str(target.param_key or "category"),
+                            param_value=cid,
+                            category_id=cid,
+                            category_name=str(target.category_name or target.name or cid),
+                            parent_name=str(target.parent_name or ""),
+                            children=children,
+                        )
+                        branches.append(node)
+                        if on_branch:
+                            on_branch(node)
+                    return branches
+
+                root_ids: list[str] = []
+                root_meta: dict[str, dict] = {}
+                for target in categories:
+                    cid = str(target.param_value or target.category_id or "").strip()
+                    if not cid or cid in root_meta:
+                        continue
+                    root_ids.append(cid)
+                    root_meta[cid] = {
+                        "name": target.name or cid,
+                        "url": target.url,
+                    }
+                return loader.expand_global_category_subtrees(
+                    root_ids,
+                    self.on_progress,
+                    self.on_manual_bypass,
+                    on_subcategories_begin=on_subcategories_begin,
+                    on_branch=on_branch,
+                    root_meta=root_meta,
+                    timeout_sec=None,
+                )
             finally:
                 close_session_context(browser, context, mode)
 
@@ -937,19 +1129,115 @@ class OzonParser:
             finally:
                 close_session_context(browser, context, mode)
 
+    def _parse_mode_label(self, mode: ParseMode) -> str:
+        labels = {
+            PARSE_MODE_GLOBAL_CATEGORIES: "выбранные категории (весь Ozon)",
+            PARSE_MODE_ALL_SELLERS_CATEGORIES: "все магазины × выбранные категории",
+            PARSE_MODE_ALL_SELLERS_FULL: "все магазины × полный каталог",
+            PARSE_MODE_SELLER_FULL: "конкретный магазин × все товары",
+            PARSE_MODE_SELLER_CATEGORIES: "конкретный магазин × выбранные категории",
+        }
+        return labels.get(mode, str(mode))
+
+    def _whole_store_target(
+        self,
+        seller_url: str,
+        label: str = "Весь магазин",
+    ) -> CategoryTarget:
+        return CategoryTarget(
+            id=f"seller|full|{seller_url}",
+            name=label,
+            url=seller_url,
+            section="Категория",
+            param_key="",
+            param_value="",
+            seller_scope=seller_url,
+        )
+
+    def _build_parse_jobs(
+        self,
+        settings: ParseSettings,
+        categories: list[CategoryTarget],
+        page: Page | None,
+    ) -> list[tuple[str, list[CategoryTarget]]]:
+        mode = settings.parse_mode
+        if mode == PARSE_MODE_GLOBAL_CATEGORIES:
+            return [("", list(categories))]
+        if mode == PARSE_MODE_SELLER_CATEGORIES:
+            seller = normalize_seller_url(
+                settings.seller_url,
+                settings.browser_mode,
+                self._session_mode,
+            )
+            return [(seller, list(categories))]
+        if mode == PARSE_MODE_SELLER_FULL:
+            seller = normalize_seller_url(
+                settings.seller_url,
+                settings.browser_mode,
+                self._session_mode,
+            )
+            return [(seller, [self._whole_store_target(seller)])]
+        if mode in (PARSE_MODE_ALL_SELLERS_CATEGORIES, PARSE_MODE_ALL_SELLERS_FULL):
+            if page is None:
+                return []
+            sellers = discover_marketplace_sellers(
+                page,
+                progress=self.on_progress,
+                on_manual_bypass=self.on_manual_bypass,
+                max_sellers=MAX_MARKETPLACE_SELLERS,
+            )
+            if not sellers:
+                self.on_progress("Список магазинов пуст — нечего обходить")
+                return []
+            jobs: list[tuple[str, list[CategoryTarget]]] = []
+            for seller in sellers:
+                if self.is_stopped():
+                    break
+                if mode == PARSE_MODE_ALL_SELLERS_FULL:
+                    jobs.append((seller, [self._whole_store_target(seller)]))
+                else:
+                    jobs.append(
+                        (
+                            seller,
+                            [replace(target, seller_scope=seller) for target in categories],
+                        )
+                    )
+            return jobs
+        return []
+
     def _build_catalog_url(
         self,
         seller_url: str,
         param_key: str | None = None,
         param_value: str | None = None,
         browser_mode: BrowserMode = DESKTOP_MODE,
+        category_id: str = "",
     ) -> str:
         base = seller_url.rstrip("/") + "/"
-        if param_key and param_value:
-            parsed = urlparse(base)
-            query = urlencode({param_key: param_value, "sorting": "price"})
-            return urlunparse((parsed.scheme, parsed.netloc, parsed.path, "", query, ""))
-        return with_price_sort_asc(base, browser_mode, self._session_mode)
+        return sanitize_catalog_url(
+            base,
+            param_key=str(param_key or ""),
+            param_value=str(param_value or ""),
+            category_id=str(category_id or ""),
+            browser_mode=browser_mode,
+            session_mode=self._session_mode,
+            keep_sorting=True,
+        )
+
+    def _catalog_url_for_target(
+        self,
+        seller_url: str,
+        target: CategoryTarget,
+        settings: ParseSettings,
+    ) -> str:
+        """Clean seller catalog URL — never use raw target.url (stale Ozon filters)."""
+        return self._build_catalog_url(
+            seller_url,
+            target.param_key,
+            target.param_value,
+            settings.browser_mode,
+            category_id=target.category_id or "",
+        )
 
     def _global_category_parse_url(
         self,
@@ -964,9 +1252,15 @@ class OzonParser:
         seller = self._route_url("https://www.ozon.ru/seller/0/", browser_mode)
         parsed = urlparse(seller)
         path = parsed.path if parsed.path.endswith("/") else parsed.path + "/"
-        query = urlencode({"category": str(category_id)})
-        base = urlunparse((parsed.scheme, parsed.netloc, path, "", query, ""))
-        return with_price_sort_asc(base, browser_mode, self._session_mode)
+        base = urlunparse((parsed.scheme, parsed.netloc, path, "", "", ""))
+        return sanitize_catalog_url(
+            base,
+            param_key="category",
+            param_value=str(category_id),
+            browser_mode=browser_mode,
+            session_mode=self._session_mode,
+            keep_sorting=True,
+        )
 
     def _resolve_global_category_id(self, target: CategoryTarget) -> str:
         for candidate in (target.category_id, target.param_value):
@@ -997,6 +1291,83 @@ class OzonParser:
             browser_mode,
             self._session_mode,
         )
+
+    def _build_global_category_direct_url(
+        self,
+        category_id: str,
+        browser_mode: BrowserMode = DESKTOP_MODE,
+    ) -> str:
+        base = self._route_url(
+            f"https://www.ozon.ru{GLOBAL_CATALOG_PATH.rstrip('/')}/{category_id}/",
+            browser_mode,
+        )
+        return sanitize_catalog_url(
+            base,
+            browser_mode=browser_mode,
+            session_mode=self._session_mode,
+            keep_sorting=True,
+        )
+
+    def _recover_empty_catalog_page(
+        self,
+        page: Page,
+        clean_url: str,
+        settings: ParseSettings,
+        target: CategoryTarget | None = None,
+    ) -> bool:
+        if not is_empty_catalog_filter_page(page):
+            return True
+
+        label = (target.name if target else "") or "категория"
+        self.on_progress(
+            f"Пустая выдача у «{label}» (лишние фильтры Ozon) — сбрасываем..."
+        )
+
+        # Reset button often drops category= — always reopen the clean URL after.
+        if try_reset_catalog_filters(page):
+            human_delay(1.0, 2.0)
+            self.on_progress("Нажато «Сбросить фильтры» — возвращаем чистый URL категории")
+
+        routed = self._route_url(clean_url, settings.browser_mode)
+        if safe_goto(
+            page,
+            routed,
+            self.on_progress,
+            max_retries=SAFE_GOTO_MAX_RETRIES,
+            on_manual_bypass=self.on_manual_bypass,
+        ):
+            human_delay(1.0, 2.0)
+            if not is_empty_catalog_filter_page(page):
+                self.on_progress("Открыта чистая ссылка каталога без лишних фильтров")
+                return True
+
+        if settings.parse_mode == PARSE_MODE_GLOBAL_CATEGORIES and target:
+            category_id = self._resolve_global_category_id(target)
+            if category_id:
+                direct_url = self._build_global_category_direct_url(
+                    category_id,
+                    settings.browser_mode,
+                )
+                if safe_goto(
+                    page,
+                    direct_url,
+                    self.on_progress,
+                    max_retries=SAFE_GOTO_MAX_RETRIES,
+                    on_manual_bypass=self.on_manual_bypass,
+                ):
+                    human_delay(1.0, 2.0)
+                    if not is_empty_catalog_filter_page(page):
+                        self.on_progress(
+                            f"Категория открыта напрямую: /category/{category_id}/"
+                        )
+                        return True
+
+        if is_empty_catalog_filter_page(page):
+            self.on_progress(
+                "Не удалось убрать пустую выдачу — категория будет пропущена до следующего запуска"
+            )
+            return False
+        return True
 
     def _ensure_price_sort_asc(self, page: Page) -> None:
         try:
@@ -1033,6 +1404,7 @@ class OzonParser:
         category: CategoryTarget | None = None,
         product_cap: int | None = None,
         on_progress_save: Callable[[list[ProductRow]], None] | None = None,
+        specific_seller: bool | None = None,
     ) -> tuple[list[ProductRow], bool]:
         collected: list[ProductRow] = []
         for attempt in range(1, MAX_CATEGORY_RETRIES + 1):
@@ -1046,6 +1418,7 @@ class OzonParser:
                 category,
                 product_cap=product_cap,
                 on_progress_save=on_progress_save,
+                specific_seller=specific_seller,
             )
             collected.extend(results)
             collected = self._dedupe_products(collected)
@@ -1099,44 +1472,8 @@ class OzonParser:
             )
             self.on_progress(f"URL каталога: {routed_url}")
 
-        # Global catalogue: one soft navigation to /seller/0/?category=… per leaf
-        # (same listing+scroll pattern as a specific shop filter page).
-        if not specific_seller:
-            return self._soft_goto_seller_category(page, routed_url)
-
-        if target and is_seller_page(page):
-            selectors: list[str] = []
-            query = urlparse(target.url).query if target.url else ""
-            if query:
-                for part in query.split("&"):
-                    if part:
-                        selectors.append(f'a[href*="{part}"]')
-                        selectors.append(f'a[href*="{part.replace("=", "%3D")}"]')
-            if target.param_key and target.param_value:
-                selectors.append(f'a[href*="{target.param_key}={target.param_value}"]')
-                selectors.append(
-                    f'a[href*="{target.param_key}%3D{target.param_value}"]'
-                )
-            for selector in selectors:
-                try:
-                    link = page.query_selector(selector)
-                    if link and link.is_visible():
-                        section = target.section or "Фильтр"
-                        self.on_progress(f"Переход: {section} — {target.name or target.id}")
-                        link.click()
-                        human_delay(2.0, 4.0)
-                        if is_access_restricted(page):
-                            return False
-                        current = page.url.lower()
-                        if target.param_key and target.param_value:
-                            key = target.param_key.lower()
-                            val = target.param_value.lower()
-                            if f"{key}={val}" in current or f"{key}%3d{val}" in current:
-                                return True
-                        if query and all(part.lower() in current for part in query.split("&") if part):
-                            return True
-                except Exception:
-                    continue
+        # Always open a sanitized URL directly. Clicking filter links on the seller
+        # page often carries stale query flags and lands on «Сбросить фильтры».
         return safe_goto(
             page,
             routed_url,
@@ -1153,6 +1490,7 @@ class OzonParser:
         category: CategoryTarget | None = None,
         product_cap: int | None = None,
         on_progress_save: Callable[[list[ProductRow]], None] | None = None,
+        specific_seller: bool | None = None,
     ) -> tuple[list[ProductRow], bool]:
         assert self._page is not None
         page = self._page
@@ -1161,6 +1499,9 @@ class OzonParser:
         target = category
         hard_cap = product_cap if product_cap is not None else settings.max_products
         last_saved_count = 0
+        seller_mode = (
+            settings.specific_seller if specific_seller is None else specific_seller
+        )
 
         # Global and seller: same flow — open listing URL, sort by price, scroll DOM.
         # (Composer-first product fetch for global caused fab_ before useful results.)
@@ -1169,62 +1510,114 @@ class OzonParser:
             target,
             routed_url,
             settings.browser_mode,
-            specific_seller=settings.specific_seller,
+            specific_seller=seller_mode,
         ):
             if self._page and is_access_restricted(self._page):
                 self.on_progress(
                     "Ozon показал fab_/«Похоже, нет соединения» — временная блокировка, "
-                    "не ошибка интернета. Прогресс сохранён; подождите 15–30 минут "
-                    "и продолжите без повторных обновлений страницы."
+                    "не ошибка интернета. Ждём без F5, затем проверим доступ."
                 )
-                # Do not auto-retry navigation while an incident is active.
+                if not self._wait_out_access_block(
+                    settings, reopen_url=routed_url
+                ):
+                    self.on_progress(
+                        "Прогресс сохранён; подождите 15–30 минут "
+                        "и продолжите без повторных обновлений страницы."
+                    )
+                    return results, False
+                if is_access_restricted(self._page):
+                    return results, False
+            else:
+                # Generic navigation failure: stop without a second blind goto.
+                self.on_progress(
+                    "Не удалось открыть категорию. Прогресс сохранён — повторите позже."
+                )
                 return results, False
-            # Generic navigation failure: stop without a second blind goto.
-            self.on_progress(
-                "Не удалось открыть категорию. Прогресс сохранён — повторите позже."
-            )
+
+        if not self._recover_empty_catalog_page(
+            page, routed_url, settings, target
+        ):
             return results, False
 
         self._ensure_price_sort_asc(page)
+
+        if not self._recover_empty_catalog_page(
+            page, routed_url, settings, target
+        ):
+            return results, False
+
+        # First paint of tile grid is often delayed after sort/filters.
+        self._ensure_catalog_page_fully_loaded(page)
 
         empty_rounds = 0
         scroll_rounds = 0
         processed = set()
         exhausted = False
         capped = False
+        composer_fallback_used = False
+        cards_seen = 0
+        skipped_no_bonus = 0
+        finalize_attempts = 0
         # Same deep scroll budget as specific seller (not the old 1-scroll bulk cap).
         max_scrolls = 10_000
+        # Virtualized grids often need several empty passes before the next batch paints.
+        max_empty_rounds = 8
 
         while (
             not self.is_stopped()
             and len(results) < hard_cap
-            and empty_rounds < 4
+            and empty_rounds < max_empty_rounds
         ):
             if is_access_restricted(page):
                 self.on_progress(
                     "Во время сбора категории появилась блокировка Ozon (fab_)."
                 )
-                if self._wait_out_access_block(settings) and not is_access_restricted(page):
+                if self._wait_out_access_block(settings, reopen_url=routed_url):
                     self.on_progress("Блокировка снята — продолжаем прокрутку категории")
+                    self._ensure_price_sort_asc(page)
+                    self._ensure_catalog_page_fully_loaded(page)
                     empty_rounds = 0
                     continue
                 self.on_progress("Останавливаем категорию без повторных запросов.")
                 break
 
             cards = self._extract_product_cards(page, settings.browser_mode)
-            new_cards = [c for c in cards if c.get("href") not in processed]
+            if not composer_fallback_used:
+                if is_access_restricted(page):
+                    composer_fallback_used = True
+                else:
+                    composer_cards = self._try_composer_product_cards(
+                        page, routed_url, settings.browser_mode
+                    )
+                    composer_fallback_used = True
+                    if composer_cards:
+                        before_dom = len(cards)
+                        cards = self._merge_product_cards(cards, composer_cards)
+                        self.on_progress(
+                            f"Карточки: DOM {before_dom} + Composer {len(composer_cards)} "
+                            f"→ {len(cards)} уникальных"
+                        )
+            new_cards = []
+            for card in cards:
+                href = str(card.get("href") or "")
+                key = self._product_dedupe_key(href)
+                if not key or key in processed:
+                    continue
+                processed.add(key)
+                new_cards.append(card)
+            cards_seen += len(new_cards)
 
             if not new_cards:
                 empty_rounds += 1
+                # Give lazy tiles a moment before the next scroll/empty count.
+                if empty_rounds < max_empty_rounds:
+                    self._wait_catalog_batch_settle(page, timeout_sec=4.0)
             else:
                 empty_rounds = 0
 
             for card in new_cards:
                 if self.is_stopped() or len(results) >= hard_cap:
                     break
-                href = card.get("href", "")
-                if href:
-                    processed.add(href)
                 product = self._process_card(card, settings, state)
                 if product:
                     results.append(product)
@@ -1251,18 +1644,40 @@ class OzonParser:
                             name,
                             message=f"Найдено товаров: {len(results)}",
                         )
+                else:
+                    skipped_no_bonus += 1
                 human_click_delay()
+
+            if skipped_no_bonus and not results and cards_seen >= 5 and scroll_rounds == 0:
+                if settings.bonus_only:
+                    self.on_progress(
+                        f"На странице {cards_seen} карточек, но без баллов за отзыв "
+                        f"({skipped_no_bonus} пропущено)"
+                    )
+                else:
+                    self.on_progress(
+                        f"На странице {cards_seen} карточек, но ни одна не прошла фильтры "
+                        f"({skipped_no_bonus} пропущено)"
+                    )
 
             if len(results) >= hard_cap:
                 capped = True
                 break
-            if empty_rounds >= 4:
+            if empty_rounds >= max_empty_rounds:
+                if finalize_attempts < 2 and self._finalize_catalog_page_load(page):
+                    finalize_attempts += 1
+                    empty_rounds = max(0, max_empty_rounds - 3)
+                    continue
                 exhausted = True
                 break
             if scroll_rounds >= max_scrolls:
                 exhausted = True
                 break
             if not self._scroll_for_more(page):
+                if finalize_attempts < 2 and self._finalize_catalog_page_load(page):
+                    finalize_attempts += 1
+                    empty_rounds = 0
+                    continue
                 exhausted = True
                 break
             scroll_rounds += 1
@@ -1276,8 +1691,6 @@ class OzonParser:
             human_scroll_delay()
 
         access_blocked = is_blocked_page(page) or is_captcha_page(page)
-        # Hitting the requested product cap means this run got what it needed
-        # from the category (usually the remaining global goal).
         if capped:
             category_completed = True
         else:
@@ -1285,8 +1698,95 @@ class OzonParser:
                 exhausted
                 and not access_blocked
                 and not self.is_stopped()
+                and len(processed) > 0
+            )
+        if exhausted and not category_completed and not access_blocked:
+            self.on_progress(
+                "Категория не завершена: карточки товаров не найдены на странице."
             )
         return results, category_completed
+
+    def _fetch_composer_json(self, page: Page, page_url: str, browser_mode: BrowserMode) -> dict | None:
+        path = urlparse(page_url).path
+        if not path.endswith("/"):
+            path += "/"
+        full_url = self._route_url(page_url, browser_mode)
+        client_name = "mweb_client" if browser_mode == MOBILE_MODE else "dweb_client"
+        script = """
+        async ({ path, fullUrl, clientName }) => {
+            const candidates = [
+                '/api/composer-api.bx/page/json/v2?url=' + encodeURIComponent(path),
+                '/api/composer-api.bx/page/json/v2?url=' + encodeURIComponent(fullUrl),
+            ];
+            for (const apiUrl of candidates) {
+                try {
+                    const resp = await fetch(apiUrl, {
+                        credentials: 'include',
+                        headers: { 'Accept': 'application/json', 'x-o3-app-name': clientName },
+                    });
+                    if (!resp.ok) continue;
+                    return JSON.stringify(await resp.json());
+                } catch (e) {}
+            }
+            return null;
+        }
+        """
+        try:
+            raw = page.evaluate(
+                script,
+                {"path": path, "fullUrl": full_url, "clientName": client_name},
+            )
+            return json.loads(raw) if raw else None
+        except Exception:
+            return None
+
+    def _try_composer_product_cards(
+        self,
+        page: Page,
+        page_url: str,
+        browser_mode: BrowserMode,
+    ) -> list[dict]:
+        data = self._fetch_composer_json(page, page.url or page_url, browser_mode)
+        if not data:
+            return []
+        parsed = urlparse(page.url or page_url)
+        base_url = f"{parsed.scheme}://{parsed.netloc}" if parsed.netloc else "https://www.ozon.ru"
+        return extract_product_cards_from_composer(data, base_url=base_url)
+
+    @staticmethod
+    def _merge_product_cards(dom_cards: list[dict], composer_cards: list[dict]) -> list[dict]:
+        """Prefer richer single-tile text when the same product appears in both sources."""
+        merged: dict[str, dict] = {}
+
+        def tile_score(card: dict) -> tuple[int, int, int]:
+            text = str(card.get("text") or "")
+            name = str(card.get("name") or "")
+            # Prefer a single-tile blob (few prices) over a whole-grid dump.
+            price_marks = text.count("₽")
+            return (-price_marks, len(name), -abs(len(text) - 350))
+
+        def absorb(card: dict) -> None:
+            href = str(card.get("href") or "").split("#")[0].split("?")[0]
+            if not href or "/product/" not in href:
+                return
+            key = extract_ozon_product_id(href) or href.rstrip("/")
+            incoming = {
+                "href": href,
+                "name": str(card.get("name") or "").strip(),
+                "text": str(card.get("text") or ""),
+                "html": str(card.get("html") or ""),
+            }
+            prev = merged.get(key)
+            if not prev or tile_score(incoming) > tile_score(prev):
+                # Keep the best name even if another source wins on text.
+                if prev and len(prev.get("name") or "") > len(incoming.get("name") or ""):
+                    incoming["name"] = prev["name"]
+                merged[key] = incoming
+
+        for source in (dom_cards or [], composer_cards or []):
+            for card in source:
+                absorb(card)
+        return list(merged.values())
 
     def _extract_product_cards(
         self,
@@ -1294,67 +1794,120 @@ class OzonParser:
         browser_mode: BrowserMode = DESKTOP_MODE,
     ) -> list[dict]:
         script = """
-        ({ containerSelectors }) => {
+        () => {
             const cards = new Map();
             const normalize = (text) => (text || '').trim().replace(/\\s+/g, ' ');
-            const findContainer = (link) => {
-                for (const selector of containerSelectors) {
-                    const container = link.closest(selector);
-                    if (container) return container;
-                }
-                return link.parentElement || link;
+            const productId = (href) => {
+                const path = String(href || '').split('#')[0].split('?')[0];
+                let m = path.match(/\\/product\\/(?:[^\\/]*?-)?(\\d{6,})\\/?$/i);
+                if (m) return m[1];
+                m = path.match(/\\/product\\/[^\\/?#]*?(\\d{6,})/i);
+                return m ? m[1] : '';
             };
-            document.querySelectorAll('a[href*="/product/"]').forEach(link => {
+            const canonicalHref = (href) => String(href || '').split('#')[0].split('?')[0];
+            const noise = /балл|бонус|отзыв|распродаж|суперцен|ценопад|новинка|^хит$|^\\d+\\s*шт\\.?$|осталось\\s+\\d+|в корзину|в избранное|бесплатная доставка|^акция$|^скидка$/i;
+            const isNoise = (value) => {
+                if (!value || value.length < 3 || /₽/.test(value)) return true;
+                if (noise.test(value)) return true;
+                if (/^[-−+]?\\d+\\s*%$/.test(value)) return true;
+                if (/^\\d([.,]\\d)?$/.test(value)) return true;
+                return false;
+            };
+            const uniqueProductHrefs = (root) => {
+                const hrefs = new Set();
+                root.querySelectorAll('a[href*="/product/"]').forEach((a) => {
+                    const href = canonicalHref(a.href || a.getAttribute('href') || '');
+                    if (href.includes('/product/')) hrefs.add(href);
+                });
+                return hrefs;
+            };
+            // Climb until just before a multi-product grid; never use the whole catalog.
+            const findContainer = (link) => {
+                const own = canonicalHref(link.href || link.getAttribute('href') || '');
+                let node = link.parentElement;
+                let best = link;
+                for (let depth = 0; depth < 14 && node; depth++) {
+                    const hrefs = uniqueProductHrefs(node);
+                    if (hrefs.size > 1) {
+                        return best;
+                    }
+                    best = node;
+                    if (
+                        node.matches &&
+                        node.matches('[data-index], article, [class*="tile-root"], [class*="tile_"]')
+                    ) {
+                        return node;
+                    }
+                    // Prefer a compact single-product node.
+                    if (hrefs.size === 1 && hrefs.has(own) && (node.innerText || '').length > 40) {
+                        const prices = ((node.innerText || '').match(/₽/g) || []).length;
+                        if (prices > 0 && prices <= 4) {
+                            best = node;
+                        }
+                    }
+                    node = node.parentElement;
+                }
+                return best;
+            };
+            const pickName = (link, container) => {
+                const candidates = [];
+                const ownTitle = normalize(link.getAttribute('title') || '');
+                const ownText = normalize(link.textContent || '');
+                if (!isNoise(ownTitle)) candidates.push(ownTitle);
+                if (!isNoise(ownText) && ownText.length >= 8) candidates.push(ownText);
+                container.querySelectorAll('a[href*="/product/"], [title]').forEach((el) => {
+                    const elHref = canonicalHref(el.href || el.getAttribute('href') || '');
+                    const linkHref = canonicalHref(link.href || link.getAttribute('href') || '');
+                    if (elHref && linkHref && elHref !== linkHref && elHref.includes('/product/')) {
+                        return;
+                    }
+                    const titleAttr = normalize(el.getAttribute('title') || '');
+                    const value = normalize(el.textContent || '');
+                    if (!isNoise(titleAttr)) candidates.push(titleAttr);
+                    if (!isNoise(value)) candidates.push(value);
+                });
+                const unique = Array.from(new Set(candidates.filter(Boolean)));
+                return unique.sort((a, b) => {
+                    const score = (s) => ((s.match(/[A-Za-zА-Яа-яЁё]/g) || []).length) * 10 + s.length;
+                    return score(b) - score(a);
+                })[0] || '';
+            };
+
+            document.querySelectorAll('a[href*="/product/"]').forEach((link) => {
                 const href = link.href || link.getAttribute('href') || '';
                 if (!href.includes('/product/')) return;
-                let canonical = href.split('#')[0].split('?')[0];
+                const canonical = canonicalHref(href);
+                const id = productId(canonical);
+                const key = id || canonical;
+                if (!key) return;
                 const container = findContainer(link);
+                // Guard: skip if container still looks like a whole grid.
+                if (uniqueProductHrefs(container).size > 1) return;
                 const text = container.innerText || '';
-                const candidates = [];
-                container.querySelectorAll('a[href*="/product/"], [title]').forEach(el => {
-                    const value = normalize(el.textContent || el.getAttribute('title') || '');
-                    if (!value || value.length < 3 || /₽/.test(value)) return;
-                    if (/балл|бонус|отзыв/i.test(value)) return;
-                    candidates.push(value);
-                });
-                const name = candidates.sort((a, b) => b.length - a.length)[0] || '';
+                if ((text.match(/₽/g) || []).length > 6) return;
+                const name = pickName(link, container);
                 const card = {
                     href: canonical,
                     name,
                     text,
                     html: container.innerHTML || ''
                 };
-                const previous = cards.get(canonical);
-                if (!previous || card.text.length > previous.text.length) {
-                    cards.set(canonical, card);
+                const previous = cards.get(key);
+                const better =
+                    !previous ||
+                    ((text.match(/₽/g) || []).length < ((previous.text || '').match(/₽/g) || []).length) ||
+                    ((text.match(/₽/g) || []).length === ((previous.text || '').match(/₽/g) || []).length &&
+                        text.length < previous.text.length && text.length > 40) ||
+                    (name && name.length > (previous.name || '').length);
+                if (better) {
+                    cards.set(key, card);
                 }
             });
             return Array.from(cards.values());
         }
         """
-        common = [
-            '[data-index]',
-            'article',
-            '[data-widget*="searchResults"] article',
-            '[data-widget*="tile"]',
-        ]
-        mode_specific = (
-            [
-                '[data-widget="searchResultsV2"] > div',
-                '[data-widget="searchResultsV2"] article',
-            ]
-            if browser_mode == DESKTOP_MODE
-            else [
-                '[data-widget*="searchResults"] > div',
-                '[data-widget*="catalog"] article',
-                '[data-widget*="product"]',
-            ]
-        )
         try:
-            return page.evaluate(
-                script,
-                {"containerSelectors": mode_specific + common},
-            ) or []
+            return page.evaluate(script) or []
         except Exception:
             return []
 
@@ -1363,35 +1916,66 @@ class OzonParser:
         html = card.get("html", "")
         if has_bonus_text(text) or has_bonus_text(html):
             return True
+        if parse_bonus_points(text) or parse_bonus_points(html):
+            return True
         html_lower = html.lower()
         if "отзыв" in html_lower and ("балл" in html_lower or "bonus" in html_lower):
             return True
         if "review" in html_lower and "bonus" in html_lower:
+            return True
+        if "отзыв" in html_lower and ("₽" in html or re.search(r"\d", html)):
             return True
         return False
 
     def _process_card(self, card: dict, settings: ParseSettings, state: _ParseState) -> ProductRow | None:
         href = self._canonical_product_url(card.get("href", ""))
         text = card.get("text", "")
-        if not href or href in state.seen_urls:
+        html = card.get("html", "") or ""
+        product_id = extract_ozon_product_id(href)
+        if not href:
+            return None
+        if href in state.seen_urls:
+            return None
+        if product_id and product_id in state.seen_product_ids:
             return None
 
         detail = self._parse_card_text(text)
+        # Listing tiles often put price/bonus only in HTML attributes / nested spans.
+        if html and (
+            not detail.get("name")
+            or detail.get("price_discounted") is None
+            or detail.get("bonus_points") is None
+        ):
+            html_detail = self._parse_card_text(re.sub(r"<[^>]+>", "\n", html))
+            if not detail.get("name") and html_detail.get("name"):
+                detail["name"] = html_detail["name"]
+            if detail.get("price_discounted") is None and html_detail.get("price_discounted") is not None:
+                detail["price_discounted"] = html_detail["price_discounted"]
+                detail["price_original"] = html_detail.get("price_original")
+            if detail.get("bonus_points") is None and html_detail.get("bonus_points") is not None:
+                detail["bonus_points"] = html_detail["bonus_points"]
         detail["url"] = href
 
-        name = card.get("name") or detail.get("name") or self._extract_name_from_text(text)
+        name = pick_product_name(card.get("name")) or pick_product_name(
+            detail.get("name"),
+            text,
+            re.sub(r"<[^>]+>", "\n", html) if html else "",
+        )
         price_disc = detail.get("price_discounted")
         price_orig = detail.get("price_original")
         bonus = detail.get("bonus_points")
+        if not isinstance(bonus, int) or bonus <= 0:
+            bonus = parse_bonus_points(text) or parse_bonus_points(html)
         card_has_bonus = self._card_has_bonus(card)
 
-        # Keep only products that advertise review bonus points on the listing.
-        if not card_has_bonus and not (isinstance(bonus, int) and bonus > 0):
-            return None
+        # Keep only products that advertise review bonus when bonus_only is on.
+        if settings.bonus_only:
+            if not card_has_bonus and not (isinstance(bonus, int) and bonus > 0):
+                return None
 
         # Bulk-safe mode: never open product pages. Missing fields are skipped.
         if (
-            (not name or price_disc is None or bonus is None or bonus <= 0)
+            (not name or price_disc is None or (settings.bonus_only and (bonus is None or bonus <= 0)))
             and MAX_PRODUCT_DETAIL_FETCHES > 0
             and state.detail_fetches < MAX_PRODUCT_DETAIL_FETCHES
         ):
@@ -1408,8 +1992,10 @@ class OzonParser:
 
         if not name or price_disc is None:
             return None
-        if not isinstance(bonus, int) or bonus <= 0:
+        if settings.bonus_only and (not isinstance(bonus, int) or bonus <= 0):
             return None
+        if not isinstance(bonus, int) or bonus < 0:
+            bonus = 0
         if price_orig is None or price_orig < price_disc:
             price_orig = price_disc
         if settings.min_price is not None and price_disc < settings.min_price:
@@ -1418,6 +2004,8 @@ class OzonParser:
             return None
 
         state.seen_urls.add(href)
+        if product_id:
+            state.seen_product_ids.add(product_id)
         return ProductRow(
             name=name,
             price_discounted=price_disc,
@@ -1437,28 +2025,21 @@ class OzonParser:
                 for match in re.finditer(r"([\d\s\u2009]+)\s*₽", line)
                 if (price := parse_price(match.group(0))) is not None
             )
-        bonus = next((parse_bonus_points(ln) for ln in lines if has_bonus_text(ln)), None)
-        name = next(
-            (
-                ln
-                for ln in lines
-                if ln
-                and not re.search(r"\d[\d\s]*\s*₽", ln)
-                and not has_bonus_text(ln)
-                and not re.fullmatch(r"[-−+]?\d+\s*%", ln)
-            ),
-            lines[0] if lines else "",
-        )
+        bonus = None
+        for ln in lines:
+            if has_bonus_text(ln):
+                bonus = parse_bonus_points(ln)
+                if bonus:
+                    break
+        if bonus is None:
+            bonus = parse_bonus_points(text)
+        name = pick_product_name(text, *lines)
         price_disc = min(prices) if prices else None
         price_orig = max(prices) if len(prices) > 1 else price_disc
         return {"name": name, "price_discounted": price_disc, "price_original": price_orig, "bonus_points": bonus}
 
     def _extract_name_from_text(self, text: str) -> str:
-        for line in text.split("\n"):
-            line = line.strip()
-            if line and not re.search(r"\d[\d\s]*\s*₽", line) and not has_bonus_text(line):
-                return line
-        return text.split("\n")[0].strip() if text else ""
+        return pick_product_name(text)
 
     def _fetch_product_detail(
         self,
@@ -1559,14 +2140,253 @@ class OzonParser:
                 return bonus
         return parse_bonus_points(text)
 
+    def _wait_page_load_state(self, page: Page, *, timeout_ms: int = 12000) -> None:
+        """Best-effort wait for document + short network quiet period."""
+        try:
+            page.wait_for_load_state("domcontentloaded", timeout=timeout_ms)
+        except Exception:
+            pass
+        try:
+            # Ozon keeps long-polling; networkidle often never completes — keep short.
+            page.wait_for_load_state("networkidle", timeout=min(4500, timeout_ms))
+        except Exception:
+            pass
+
+    def _wait_catalog_listing_ready(
+        self,
+        page: Page,
+        *,
+        timeout_sec: float = 20.0,
+        min_products: int = 1,
+    ) -> bool:
+        """Wait until product tiles appear on the catalog page."""
+        if is_access_restricted(page):
+            return False
+        deadline = time.time() + timeout_sec
+        last_count = -1
+        while time.time() < deadline and not self.is_stopped():
+            if is_access_restricted(page):
+                return False
+            metrics = self._catalog_scroll_metrics(page)
+            count = int(metrics.get("products") or 0)
+            if count != last_count and count > 0:
+                self.on_progress(f"Ожидаем полную отрисовку каталога… карточек: {count}")
+                last_count = count
+            if count >= min_products:
+                return True
+            human_delay(0.6, 1.0)
+        return int(self._catalog_scroll_metrics(page).get("products") or 0) >= min_products
+
+    def _wait_catalog_batch_settle(
+        self,
+        page: Page,
+        *,
+        timeout_sec: float = 8.0,
+        stable_checks: int = 2,
+    ) -> dict:
+        """Wait until product count / page height stop changing after a load/scroll."""
+        if is_access_restricted(page):
+            return self._catalog_scroll_metrics(page)
+        deadline = time.time() + timeout_sec
+        prev = self._catalog_scroll_metrics(page)
+        stable = 0
+        while time.time() < deadline and not self.is_stopped():
+            if self._stop_event.wait(0.7):
+                break
+            cur = self._catalog_scroll_metrics(page)
+            same = (
+                cur["products"] == prev["products"]
+                and abs(cur["h"] - prev["h"]) <= 4
+            )
+            if same:
+                stable += 1
+                if stable >= stable_checks:
+                    return cur
+            else:
+                stable = 0
+            prev = cur
+        return self._catalog_scroll_metrics(page)
+
+    def _ensure_catalog_page_fully_loaded(self, page: Page) -> None:
+        """Open-category gate: document ready + tiles painted + batch settled."""
+        if is_access_restricted(page):
+            return
+        self.on_progress("Дожидаемся полной загрузки страницы каталога...")
+        self._wait_page_load_state(page, timeout_ms=15000)
+        wait_for_ozon_ready(page, self.on_progress, timeout_sec=20)
+        if is_access_restricted(page):
+            return
+        ready = self._wait_catalog_listing_ready(page, timeout_sec=18.0, min_products=1)
+        self._wait_catalog_batch_settle(page, timeout_sec=7.0, stable_checks=2)
+        # Warm first viewport: small scroll down and back loads lazy tiles.
+        try:
+            page.evaluate(
+                """() => {
+                    window.scrollBy(0, Math.max(300, Math.floor(window.innerHeight * 0.4)));
+                }"""
+            )
+            human_delay(1.0, 1.6)
+            self._wait_catalog_batch_settle(page, timeout_sec=5.0, stable_checks=2)
+            page.evaluate("() => window.scrollTo(0, 0)")
+            human_delay(0.6, 1.0)
+            self._wait_catalog_batch_settle(page, timeout_sec=4.0, stable_checks=2)
+        except Exception:
+            pass
+        metrics = self._catalog_scroll_metrics(page)
+        if ready or metrics["products"] > 0:
+            self.on_progress(
+                f"Страница каталога загружена: {int(metrics['products'])} карточек на экране"
+            )
+        else:
+            self.on_progress("Страница открыта, но карточки товаров ещё не появились")
+
+    def _finalize_catalog_page_load(self, page: Page) -> bool:
+        """One more full-load pass near the bottom before closing the category."""
+        if is_access_restricted(page):
+            return False
+        before = self._catalog_scroll_metrics(page)
+        self.on_progress("Финальная догрузка страницы каталога...")
+        clicked = self._click_catalog_load_more(page)
+        try:
+            page.evaluate(
+                """() => {
+                    const h = Math.max(
+                        document.body ? document.body.scrollHeight : 0,
+                        document.documentElement ? document.documentElement.scrollHeight : 0
+                    );
+                    window.scrollTo(0, h);
+                }"""
+            )
+        except Exception:
+            pass
+        self._wait_page_load_state(page, timeout_ms=8000)
+        after = self._wait_catalog_batch_settle(page, timeout_sec=8.0, stable_checks=2)
+        clicked_again = False
+        if not clicked:
+            clicked_again = self._click_catalog_load_more(page)
+            if clicked_again:
+                after = self._wait_catalog_batch_settle(page, timeout_sec=6.0, stable_checks=2)
+        grew = (
+            after["products"] > before["products"]
+            or after["h"] > before["h"] + 8
+            or clicked
+            or clicked_again
+        )
+        return bool(grew)
+
+    def _catalog_scroll_metrics(self, page: Page) -> dict:
+        try:
+            data = page.evaluate(
+                """() => {
+                    const y = window.scrollY || document.documentElement.scrollTop || 0;
+                    const h = Math.max(
+                        document.body ? document.body.scrollHeight : 0,
+                        document.documentElement ? document.documentElement.scrollHeight : 0
+                    );
+                    const ih = window.innerHeight || 0;
+                    const products = document.querySelectorAll('a[href*="/product/"]').length;
+                    return { y, h, ih, products };
+                }"""
+            )
+            if isinstance(data, dict):
+                return {
+                    "y": float(data.get("y") or 0),
+                    "h": float(data.get("h") or 0),
+                    "ih": float(data.get("ih") or 0),
+                    "products": int(data.get("products") or 0),
+                }
+        except Exception:
+            pass
+        return {"y": 0.0, "h": 0.0, "ih": 0.0, "products": 0}
+
+    def _click_catalog_load_more(self, page: Page) -> bool:
+        """Click «Показать ещё» / similar controls when infinite scroll stalls."""
+        selectors = (
+            'button:has-text("Показать ещё")',
+            'button:has-text("Показать еще")',
+            'div[role="button"]:has-text("Показать ещё")',
+            'div[role="button"]:has-text("Показать еще")',
+            'a:has-text("Показать ещё")',
+            'a:has-text("Показать еще")',
+            'button:has-text("Показать больше")',
+            '[data-widget*="megaPaginator"] button',
+            '[data-widget*="paginator"] button:has-text("дальше")',
+            '[data-widget*="paginator"] a:has-text("дальше")',
+        )
+        for selector in selectors:
+            try:
+                el = page.query_selector(selector)
+                if el and el.is_visible():
+                    el.click(timeout=3000)
+                    self.on_progress("Нажато «Показать ещё» для догрузки товаров")
+                    return True
+            except Exception:
+                continue
+        return False
+
     def _scroll_for_more(self, page: Page) -> bool:
+        """Scroll the product grid; True if more items may still load.
+
+        Ozon often uses a virtualized feed where document.scrollHeight stops growing.
+        Do not treat a flat height as end-of-list — keep scrolling until we cannot
+        move further and no load-more control is present. After each move, wait for
+        the next product batch to fully paint.
+        """
         if is_blocked_page(page):
             return False
         try:
-            prev = page.evaluate("() => document.body.scrollHeight")
-            page.evaluate("window.scrollBy(0, window.innerHeight * 0.85)")
-            human_delay(2.0, 3.5)
-            return page.evaluate("() => document.body.scrollHeight") > prev
+            before = self._catalog_scroll_metrics(page)
+            if self._click_catalog_load_more(page):
+                self._wait_page_load_state(page, timeout_ms=8000)
+                after_click = self._wait_catalog_batch_settle(
+                    page, timeout_sec=8.0, stable_checks=2
+                )
+                if (
+                    after_click["h"] > before["h"]
+                    or after_click["products"] > before["products"]
+                    or after_click["y"] > before["y"] + 5
+                ):
+                    return True
+                # Button may still be loading — allow another round.
+                return True
+
+            page.evaluate(
+                """() => {
+                    const step = Math.max(480, Math.floor(window.innerHeight * 0.92));
+                    window.scrollBy(0, step);
+                }"""
+            )
+            self._wait_page_load_state(page, timeout_ms=6000)
+            after = self._wait_catalog_batch_settle(page, timeout_sec=7.0, stable_checks=2)
+            grew = after["h"] > before["h"] + 2
+            more_products = after["products"] > before["products"]
+            moved = after["y"] > before["y"] + 20
+            room_left = after["y"] + after["ih"] < after["h"] - 24
+            if grew or more_products or moved or room_left:
+                return True
+
+            # Last nudge: hard scroll to bottom in case a sticky bar blocked the step.
+            page.evaluate(
+                """() => {
+                    const h = Math.max(
+                        document.body ? document.body.scrollHeight : 0,
+                        document.documentElement ? document.documentElement.scrollHeight : 0
+                    );
+                    window.scrollTo(0, h);
+                }"""
+            )
+            self._wait_page_load_state(page, timeout_ms=6000)
+            final = self._wait_catalog_batch_settle(page, timeout_sec=6.0, stable_checks=2)
+            if (
+                final["h"] > after["h"] + 2
+                or final["products"] > after["products"]
+                or final["y"] > after["y"] + 20
+            ):
+                return True
+            if self._click_catalog_load_more(page):
+                self._wait_catalog_batch_settle(page, timeout_sec=6.0, stable_checks=2)
+                return True
+            return False
         except Exception:
             return False
 
@@ -1575,4 +2395,13 @@ class OzonParser:
         if not url:
             return ""
         parsed = urlparse(to_desktop_product_url(url))
-        return urlunparse((parsed.scheme, parsed.netloc, parsed.path, "", "", ""))
+        path = parsed.path or ""
+        if path and not path.endswith("/"):
+            path += "/"
+        return urlunparse((parsed.scheme, parsed.netloc, path, "", "", ""))
+
+    @classmethod
+    def _product_dedupe_key(cls, url: str) -> str:
+        """Stable key: numeric product id when possible, else canonical URL."""
+        canonical = cls._canonical_product_url(url)
+        return extract_ozon_product_id(canonical) or canonical

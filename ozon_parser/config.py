@@ -27,6 +27,38 @@ DESKTOP_BASE_URL = "https://www.ozon.ru"
 ALL_SELLERS_PATH = "/seller/"
 GLOBAL_CATALOG_PATH = "/category/"
 
+# Parse scope modes (see UI combo in app.py).
+ParseMode = Literal[
+    "global_categories",        # 3.1 selected categories, whole Ozon listing
+    "all_sellers_categories",   # 3.2 each seller × selected categories
+    "all_sellers_full",         # 3.3 each seller × full catalog
+    "seller_full",              # 3.4.1 one seller × all products
+    "seller_categories",        # 3.4.2 one seller × selected categories
+]
+
+PARSE_MODE_GLOBAL_CATEGORIES: ParseMode = "global_categories"
+PARSE_MODE_ALL_SELLERS_CATEGORIES: ParseMode = "all_sellers_categories"
+PARSE_MODE_ALL_SELLERS_FULL: ParseMode = "all_sellers_full"
+PARSE_MODE_SELLER_FULL: ParseMode = "seller_full"
+PARSE_MODE_SELLER_CATEGORIES: ParseMode = "seller_categories"
+
+GLOBAL_PARSE_MODES = frozenset({
+    PARSE_MODE_GLOBAL_CATEGORIES,
+    PARSE_MODE_ALL_SELLERS_CATEGORIES,
+    PARSE_MODE_ALL_SELLERS_FULL,
+})
+SELLER_PARSE_MODES = frozenset({
+    PARSE_MODE_SELLER_FULL,
+    PARSE_MODE_SELLER_CATEGORIES,
+})
+CATEGORY_REQUIRED_PARSE_MODES = frozenset({
+    PARSE_MODE_GLOBAL_CATEGORIES,
+    PARSE_MODE_ALL_SELLERS_CATEGORIES,
+    PARSE_MODE_SELLER_CATEGORIES,
+})
+
+MAX_MARKETPLACE_SELLERS = 300
+
 CHROME_DEBUG_PORT = 9222
 CDP_URL = f"http://127.0.0.1:{CHROME_DEBUG_PORT}"
 
@@ -51,10 +83,10 @@ DELAY_SCROLL_MIN = 2.5
 DELAY_SCROLL_MAX = 5.0
 DELAY_CLICK_MIN = 0.8
 DELAY_CLICK_MAX = 2.0
-DELAY_BETWEEN_CATEGORIES_MIN = 25.0
-DELAY_BETWEEN_CATEGORIES_MAX = 45.0
-DELAY_BETWEEN_PRODUCT_PAGES_MIN = 12.0
-DELAY_BETWEEN_PRODUCT_PAGES_MAX = 20.0
+DELAY_BETWEEN_CATEGORIES_MIN = 12.0
+DELAY_BETWEEN_CATEGORIES_MAX = 25.0
+DELAY_BETWEEN_PRODUCT_PAGES_MIN = 8.0
+DELAY_BETWEEN_PRODUCT_PAGES_MAX = 18.0
 
 # Soft wave budgets inside ONE continuous run. Hitting a wave triggers an
 # automatic cooldown (shown in progress), then parsing continues — so 10k
@@ -67,48 +99,52 @@ GLOBAL_SESSION_MAX_PRODUCTS = 60
 GLOBAL_LARGE_SELECTION_THRESHOLD = 50
 CHECKPOINT_SAVE_EVERY_PRODUCTS = 20
 
-# Auto-pauses by product count (shown in progress bar/log).
+# Auto-pauses: never longer than 25 seconds.
 PRODUCT_BATCH_SIZE = 25
-PRODUCT_BATCH_PAUSE_MIN = 25.0
-PRODUCT_BATCH_PAUSE_MAX = 45.0
+PRODUCT_BATCH_PAUSE_MIN = 12.0
+PRODUCT_BATCH_PAUSE_MAX = 22.0
 PRODUCT_MEGA_BATCH_SIZE = 400
-PRODUCT_MEGA_PAUSE_MIN = 180.0
-PRODUCT_MEGA_PAUSE_MAX = 300.0
+PRODUCT_MEGA_PAUSE_MIN = 18.0
+PRODUCT_MEGA_PAUSE_MAX = 25.0
 
 # Wave cooldown after N categories / +N products in the current wave.
-WAVE_COOLDOWN_MIN = 120.0
-WAVE_COOLDOWN_MAX = 210.0
-GLOBAL_WAVE_COOLDOWN_MIN = 180.0
-GLOBAL_WAVE_COOLDOWN_MAX = 300.0
+WAVE_COOLDOWN_MIN = 12.0
+WAVE_COOLDOWN_MAX = 25.0
+GLOBAL_WAVE_COOLDOWN_MIN = 15.0
+GLOBAL_WAVE_COOLDOWN_MAX = 25.0
 
 SAFE_CATEGORY_BATCH_SIZE = 3
-SAFE_CATEGORY_BREAK_MIN = 120.0
-SAFE_CATEGORY_BREAK_MAX = 240.0
+SAFE_CATEGORY_BREAK_MIN = 12.0
+SAFE_CATEGORY_BREAK_MAX = 25.0
 GLOBAL_SAFE_CATEGORY_BATCH_SIZE = 1
-GLOBAL_SAFE_CATEGORY_BREAK_MIN = 180.0
-GLOBAL_SAFE_CATEGORY_BREAK_MAX = 300.0
-GLOBAL_FIRST_CATEGORY_PAUSE_MIN = 25.0
-GLOBAL_FIRST_CATEGORY_PAUSE_MAX = 45.0
-GLOBAL_BETWEEN_CATEGORIES_MIN = 55.0
-GLOBAL_BETWEEN_CATEGORIES_MAX = 95.0
+GLOBAL_SAFE_CATEGORY_BREAK_MIN = 15.0
+GLOBAL_SAFE_CATEGORY_BREAK_MAX = 25.0
+GLOBAL_FIRST_CATEGORY_PAUSE_MIN = 12.0
+GLOBAL_FIRST_CATEGORY_PAUSE_MAX = 22.0
+GLOBAL_BETWEEN_CATEGORIES_MIN = 12.0
+GLOBAL_BETWEEN_CATEGORIES_MAX = 25.0
 # Global multi-category parse: one child at a time with human-like gaps.
-GLOBAL_COMPOSER_PARSE_PAUSE_MIN = 18.0
-GLOBAL_COMPOSER_PARSE_PAUSE_MAX = 35.0
+GLOBAL_COMPOSER_PARSE_PAUSE_MIN = 10.0
+GLOBAL_COMPOSER_PARSE_PAUSE_MAX = 20.0
 GLOBAL_COMPOSER_GROUP_SIZE = 1
-GLOBAL_COMPOSER_GROUP_PAUSE_MIN = 55.0
-GLOBAL_COMPOSER_GROUP_PAUSE_MAX = 95.0
+GLOBAL_COMPOSER_GROUP_PAUSE_MIN = 12.0
+GLOBAL_COMPOSER_GROUP_PAUSE_MAX = 25.0
 # Hard navigations for global mode only as last resort / first warmup.
 GLOBAL_NAV_FALLBACK_MAX = 3
 GLOBAL_BULK_MAX_SCROLLS = 1
 SAFE_SCROLL_BATCH_SIZE = 6
-SAFE_SCROLL_BREAK_MIN = 35.0
-SAFE_SCROLL_BREAK_MAX = 70.0
-BLOCK_COOLDOWN_MIN = 45.0
-BLOCK_COOLDOWN_MAX = 90.0
-ANTIBOT_WAIT_TIMEOUT_SEC = 120.0
-# Within a long run, wait passively for fab_/«нет соединения» to clear once.
-BLOCK_AUTO_WAIT_SEC = 1200.0
-BLOCK_AUTO_WAIT_POLL_SEC = 30.0
+SAFE_SCROLL_BREAK_MIN = 12.0
+SAFE_SCROLL_BREAK_MAX = 22.0
+BLOCK_COOLDOWN_MIN = 12.0
+BLOCK_COOLDOWN_MAX = 25.0
+ANTIBOT_WAIT_TIMEOUT_SEC = 25.0
+# Within a long run, park the tab and wait passively for fab_/«нет соединения».
+# Short waits (~25s) almost never clear an incident; F5 prolongs the block.
+BLOCK_AUTO_WAIT_SEC = 90.0
+BLOCK_AUTO_WAIT_POLL_SEC = 8.0
+BLOCK_AUTO_WAIT_MAX_ATTEMPTS = 3
+BLOCK_POST_CLEAR_COOLDOWN_MIN = 12.0
+BLOCK_POST_CLEAR_COOLDOWN_MAX = 25.0
 
 MAX_CATEGORY_RETRIES = 1
 # Never auto-retry page.goto while an incident/fab_ page is active.
@@ -116,22 +152,29 @@ SAFE_GOTO_MAX_RETRIES = 1
 # Detail-page opens are the main ban trigger. Bulk mode uses listing cards only.
 MAX_PRODUCT_DETAIL_FETCHES = 0
 CATALOG_LOAD_TIMEOUT_SEC = 900
-# Category-tree Composer: slow & sequential — fast parallel batches cause fab_
-# («Похоже, нет соединения») before parsing even starts.
-GLOBAL_COMPOSER_BATCH_SIZE = 1
+# Category-tree crawl strategy:
+# - page + «Посмотреть все» only up to GLOBAL_CATEGORY_PAGE_MAX_DEPTH
+# - deeper levels filled via Composer API (no navigation) — much faster
+# Parallel Composer still tends to trigger fab_; stay sequential with short jitter.
+GLOBAL_CATEGORY_PAGE_MAX_DEPTH = 1  # 0=root page, 1=each L1 page, then API depth
+# Specific seller: walk every level with page + «Посмотреть все» (full depth).
+SELLER_CATEGORY_PAGE_MAX_DEPTH = 15
+GLOBAL_COMPOSER_BATCH_SIZE = 5
 GLOBAL_COMPOSER_BATCH_CONCURRENCY = 1
-GLOBAL_COMPOSER_BATCH_PAUSE_MIN = 2.8
-GLOBAL_COMPOSER_BATCH_PAUSE_MAX = 5.5
-# Longer cool-down every N Composer batches while walking the tree.
-GLOBAL_COMPOSER_LONG_EVERY_N = 6
-GLOBAL_COMPOSER_LONG_PAUSE_MIN = 18.0
-GLOBAL_COMPOSER_LONG_PAUSE_MAX = 32.0
-# Pause between root branches (Электроника → Одежда → …).
-GLOBAL_COMPOSER_ROOT_PAUSE_MIN = 10.0
-GLOBAL_COMPOSER_ROOT_PAUSE_MAX = 18.0
-# After full catalogue load wait before parse (hint + UI). Short 2‑min waits
-# are not enough after a full-tree Composer crawl.
-POST_CATALOG_PARSE_COOLDOWN_HINT_SEC = 900
+GLOBAL_COMPOSER_BATCH_PAUSE_MIN = 0.25
+GLOBAL_COMPOSER_BATCH_PAUSE_MAX = 0.65
+# Longer cool-down every N Composer batches / rare page visits.
+GLOBAL_COMPOSER_LONG_EVERY_N = 25
+GLOBAL_COMPOSER_LONG_PAUSE_MIN = 3.0
+GLOBAL_COMPOSER_LONG_PAUSE_MAX = 5.5
+# Pause between selected root branches (Электроника → Одежда → …).
+GLOBAL_COMPOSER_ROOT_PAUSE_MIN = 1.0
+GLOBAL_COMPOSER_ROOT_PAUSE_MAX = 2.2
+# Fixed settles during category-tree page walks.
+CATEGORY_PAGE_SETTLE_SEC = 1.0
+CATEGORY_VIEW_ALL_PAUSE_SEC = 1.0
+# After catalogue load: short cool-down hint before parse (seconds).
+POST_CATALOG_PARSE_COOLDOWN_HINT_SEC = 25
 GLOBAL_CATALOG_CACHE_TTL_SEC = 7 * 24 * 3600
 # During bulk product parse, open DOM listing at most every N categories.
 GLOBAL_DOM_EVERY_N_CATEGORIES = 8

@@ -10,6 +10,7 @@ from ozon_parser.config import (
     DESKTOP_MODE,
     GLOBAL_LARGE_SELECTION_THRESHOLD,
     GLOBAL_SESSION_MAX_CATEGORIES,
+    PARSE_MODE_GLOBAL_CATEGORIES,
     PRODUCT_BATCH_SIZE,
     PRODUCT_MEGA_BATCH_SIZE,
 )
@@ -50,7 +51,7 @@ class ContinuousWaveBudgetTests(unittest.TestCase):
             import_browser_session=True,
             use_cdp=True,
             browser_mode=DESKTOP_MODE,
-            specific_seller=False,
+            parse_mode=PARSE_MODE_GLOBAL_CATEGORIES,
         )
         cats, products = self.parser._wave_budgets(settings)
         self.assertEqual(cats, 1)
@@ -65,7 +66,7 @@ class ContinuousWaveBudgetTests(unittest.TestCase):
             max_products=500,
             use_auth=False,
             import_browser_session=True,
-            specific_seller=False,
+            parse_mode=PARSE_MODE_GLOBAL_CATEGORIES,
         )
         cats, products = self.parser._wave_budgets(settings)
         self.assertEqual(cats, GLOBAL_SESSION_MAX_CATEGORIES)
@@ -113,7 +114,7 @@ class ContinuousParseRunTests(unittest.TestCase):
             import_browser_session=True,
             use_cdp=True,
             browser_mode=DESKTOP_MODE,
-            specific_seller=False,
+            parse_mode=PARSE_MODE_GLOBAL_CATEGORIES,
         )
 
         page = Mock()
@@ -124,7 +125,7 @@ class ContinuousParseRunTests(unittest.TestCase):
 
         opened_urls: list[str] = []
 
-        def fake_soft_goto(page_obj, url):
+        def fake_soft_goto(page_obj, url, progress=None, max_retries=None, on_manual_bypass=None):
             opened_urls.append(url)
             page_obj.url = url
             return True
@@ -139,13 +140,14 @@ class ContinuousParseRunTests(unittest.TestCase):
             patch("ozon_parser.parser.ensure_ozon_session_ready", return_value=True),
             patch("ozon_parser.parser.is_access_restricted", return_value=False),
             patch("ozon_parser.parser.is_seller_page", return_value=True),
-            patch("ozon_parser.parser.page_has_usable_ozon_content", return_value=True),
-            patch("ozon_parser.parser.safe_goto", return_value=True),
             patch("ozon_parser.parser.human_delay"),
             patch("ozon_parser.parser.human_category_delay"),
             patch.object(parser, "_protective_pause", return_value=True),
             patch.object(parser, "_wait_out_access_block", return_value=True),
-            patch.object(parser, "_soft_goto_seller_category", side_effect=fake_soft_goto),
+            patch.object(parser, "_ensure_catalog_page_fully_loaded"),
+            patch.object(parser, "_finalize_catalog_page_load", return_value=False),
+            patch("ozon_parser.parser.is_empty_catalog_filter_page", return_value=False),
+            patch("ozon_parser.parser.safe_goto", side_effect=fake_soft_goto),
             patch.object(parser, "_extract_product_cards", return_value=[]),
             patch.object(parser, "_scroll_for_more", return_value=False),
             patch.object(parser, "_ensure_price_sort_asc"),
@@ -177,7 +179,7 @@ class ContinuousParseRunTests(unittest.TestCase):
             max_products=100,
             use_auth=False,
             import_browser_session=True,
-            specific_seller=False,
+            parse_mode=PARSE_MODE_GLOBAL_CATEGORIES,
         )
 
         page = Mock()

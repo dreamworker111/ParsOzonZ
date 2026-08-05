@@ -8,7 +8,20 @@ from .category_extract import is_valid_category, is_valid_category_name
 from .utils import to_desktop_url
 
 SKIP_SECTIONS = {"фильтры", "filters", "сортировка", "sort", "цена", "price"}
-SKIP_OPTION_NAMES = {"ещё", "еще", "все", "all", "показать все", "свернуть", "развернуть", "ещё..."}
+SKIP_OPTION_NAMES = {
+    "ещё",
+    "еще",
+    "все",
+    "all",
+    "показать все",
+    "посмотреть все",
+    "смотреть все",
+    "показать ещё",
+    "показать еще",
+    "свернуть",
+    "развернуть",
+    "ещё...",
+}
 FILTER_PARAM_KEYS = (
     "category",
     "type",
@@ -308,7 +321,10 @@ DOM_FILTER_SECTIONS_SCRIPT = """
     const sections = [];
     const seenSections = new Set();
     const skipTitles = new Set(['фильтры', 'filters', 'сортировка', 'sort']);
-    const skipNames = new Set(['ещё', 'еще', 'все', 'all', 'показать все', 'свернуть', 'развернуть']);
+    const skipNames = new Set([
+        'ещё', 'еще', 'все', 'all', 'показать все', 'посмотреть все',
+        'смотреть все', 'показать ещё', 'показать еще', 'свернуть', 'развернуть'
+    ]);
 
     const containers = [];
     document.querySelectorAll(

@@ -10,6 +10,7 @@ from ozon_parser.parse_checkpoint import (
     save_checkpoint,
     target_key,
 )
+from ozon_parser.config import PARSE_MODE_GLOBAL_CATEGORIES
 from ozon_parser.parser import ParseSettings
 
 
@@ -29,7 +30,7 @@ class ParseCheckpointTests(unittest.TestCase):
             max_products=max_products,
             use_auth=False,
             import_browser_session=False,
-            specific_seller=False,
+            parse_mode=PARSE_MODE_GLOBAL_CATEGORIES,
         )
 
     def test_checkpoint_round_trip_and_clear(self):

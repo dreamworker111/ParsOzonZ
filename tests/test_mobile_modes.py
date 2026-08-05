@@ -246,17 +246,18 @@ class ParserModeTests(unittest.TestCase):
         self.assertEqual(open_context.call_args.kwargs["browser_mode"], MOBILE_MODE)
         self.assertTrue(open_context.call_args.kwargs["use_auth"])
 
-    def test_mobile_card_fallback_uses_mobile_widget_containers(self):
+    def test_mobile_card_extraction_uses_single_script(self):
         page = Mock()
         page.evaluate.return_value = []
 
         OzonParser()._extract_product_cards(page, MOBILE_MODE)
 
-        payload = page.evaluate.call_args.args[1]
-        self.assertIn(
-            '[data-widget*="product"]',
-            payload["containerSelectors"],
-        )
+        self.assertEqual(page.evaluate.call_count, 1)
+        script = page.evaluate.call_args.args[0]
+        self.assertIn("findContainer", script)
+        self.assertIn("productId", script)
+        # Must not pass obsolete selector payload (grid-wide closest broke names).
+        self.assertEqual(len(page.evaluate.call_args.args), 1)
 
     def test_category_loader_routes_mobile_urls(self):
         loader = CategoryLoader(Mock(), MOBILE_MODE)

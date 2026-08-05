@@ -336,6 +336,64 @@ def page_has_usable_ozon_content(page: Page) -> bool:
     return any(marker in lowered or marker in title for marker in markers)
 
 
+# «Сбросить фильтры» alone is NOT empty — it appears on normal listings with
+# sorting/active chips. Require an actual empty-result phrase.
+EMPTY_CATALOG_MARKERS = (
+    "не нашли товары",
+    "ничего не нашлось",
+    "по вашим параметрам ничего не нашлось",
+)
+
+
+def is_empty_catalog_filter_page(page: Page) -> bool:
+    """True when Ozon shows the empty catalog state (no products for filters)."""
+    try:
+        snapshot = page.evaluate(
+            """() => {
+                const text = (document.body?.innerText || '')
+                    .replace(/\\s+/g, ' ').trim().toLowerCase();
+                const productLinks = document.querySelectorAll('a[href*="/product/"]').length;
+                return { text, productLinks };
+            }"""
+        ) or {}
+    except Exception:
+        return False
+    if not isinstance(snapshot, dict):
+        return False
+    text = str(snapshot.get("text") or "")
+    if not text:
+        return False
+    # Real product tiles mean the listing is usable even if a reset chip is visible.
+    try:
+        product_links = int(snapshot.get("productLinks") or 0)
+    except (TypeError, ValueError):
+        product_links = 0
+    if product_links >= 3:
+        return False
+    return any(marker in text for marker in EMPTY_CATALOG_MARKERS)
+
+
+def try_reset_catalog_filters(page: Page) -> bool:
+    """Click «Сбросить фильтры» when the empty catalog state is shown."""
+    selectors = (
+        'button:has-text("Сбросить фильтры")',
+        'a:has-text("Сбросить фильтры")',
+        '[role="button"]:has-text("Сбросить фильтры")',
+        'span:has-text("Сбросить фильтры")',
+        'div:has-text("Сбросить фильтры")',
+    )
+    for selector in selectors:
+        try:
+            el = page.query_selector(selector)
+            if el and el.is_visible():
+                el.click()
+                time.sleep(1.2)
+                return True
+        except Exception:
+            continue
+    return False
+
+
 def is_antibot_challenge_page(page: Page) -> bool:
     """Detect an active antibot challenge shell — not a finished page with leftover query flags."""
     try:

@@ -38,7 +38,14 @@ from ozon_parser.config import (
     FONTS_DIR,
     MOBILE_MODE,
     OUTPUT_DIR,
-    POST_CATALOG_PARSE_COOLDOWN_HINT_SEC,
+    PARSE_MODE_ALL_SELLERS_CATEGORIES,
+    PARSE_MODE_ALL_SELLERS_FULL,
+    PARSE_MODE_GLOBAL_CATEGORIES,
+    PARSE_MODE_SELLER_CATEGORIES,
+    PARSE_MODE_SELLER_FULL,
+    ParseMode,
+    CATEGORY_REQUIRED_PARSE_MODES,
+    SELLER_PARSE_MODES,
 )
 from ozon_parser.auth import has_mobile_saved_session
 from ozon_parser.export import ExportMeta, export_products
@@ -99,16 +106,24 @@ class FilterTreeWidget(QTreeWidget):
     ROLE_RAW_NAME = Qt.ItemDataRole.UserRole + 8
     ROLE_IS_PLACEHOLDER = Qt.ItemDataRole.UserRole + 9
     ROLE_EMPTY_SUBCATEGORIES = Qt.ItemDataRole.UserRole + 10
+    ROLE_PENDING_SUBCATEGORIES = Qt.ItemDataRole.UserRole + 11
+    ROLE_DEPTH = Qt.ItemDataRole.UserRole + 12
+    ROLE_FULL_PATH = Qt.ItemDataRole.UserRole + 13
 
     selectionChangedCount = pyqtSignal(int)
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.placeholder_color = QColor(THEMES["dark"].placeholder)
+        self._depth_muted = QColor(THEMES["dark"].text_muted)
+        self._depth_soft = QColor(THEMES["dark"].text_soft)
         self.setHeaderHidden(True)
         self.setRootIsDecorated(True)
         self.setAnimated(True)
-        self.setIndentation(22)
+        self.setItemsExpandable(True)
+        self.setExpandsOnDoubleClick(True)
+        self.setIndentation(32)
+        self.setUniformRowHeights(False)
         self.itemChanged.connect(self._on_item_changed)
         self._block_signals = False
 
@@ -124,6 +139,11 @@ class FilterTreeWidget(QTreeWidget):
         for index in range(self.topLevelItemCount()):
             self._refresh_placeholder_colors(self.topLevelItem(index))
 
+    def set_hierarchy_colors(self, muted: str, soft: str) -> None:
+        self._depth_muted = QColor(muted)
+        self._depth_soft = QColor(soft)
+        self._refresh_hierarchy_styles()
+
     def _refresh_placeholder_colors(self, item: QTreeWidgetItem | None) -> None:
         if item is None:
             return
@@ -137,7 +157,7 @@ class FilterTreeWidget(QTreeWidget):
         self._block_signals = True
         for root in roots:
             self.addTopLevelItem(self._create_option_item("Категория", root, depth=0))
-        self.expandToDepth(3)
+        self.expandToDepth(2)
         self._block_signals = False
         self._emit_selection_count()
 
@@ -146,6 +166,14 @@ class FilterTreeWidget(QTreeWidget):
         font = item.font(0)
         font.setItalic(True)
         item.setFont(0, font)
+
+    def _create_pending_subcategories_item(self) -> QTreeWidgetItem:
+        placeholder = QTreeWidgetItem(["Подкатегории ещё не загружены"])
+        placeholder.setFlags(placeholder.flags() & ~Qt.ItemFlag.ItemIsUserCheckable)
+        placeholder.setData(0, self.ROLE_IS_PLACEHOLDER, True)
+        placeholder.setData(0, self.ROLE_PENDING_SUBCATEGORIES, True)
+        self._style_placeholder_item(placeholder)
+        return placeholder
 
     def _create_loading_placeholder(self) -> QTreeWidgetItem:
         placeholder = QTreeWidgetItem(["Загрузка подкатегорий..."])
@@ -202,16 +230,37 @@ class FilterTreeWidget(QTreeWidget):
         self.clear()
         self._emit_selection_count()
 
-    def set_initial_roots(self, roots: list[FilterOptionNode]) -> None:
+    def set_initial_roots(
+        self,
+        roots: list[FilterOptionNode],
+        *,
+        pending_subcategories: bool = False,
+    ) -> None:
         self._block_signals = True
         for root in roots:
             item = self._create_option_item("Категория", root, depth=0)
-            item.addChild(self._create_loading_placeholder())
+            if pending_subcategories:
+                item.addChild(self._create_pending_subcategories_item())
+            else:
+                item.addChild(self._create_loading_placeholder())
             self.addTopLevelItem(item)
         self.expandToDepth(1)
         self._block_signals = False
+        self._emit_selection_count()
 
-    def _expand_item_branch(self, item: QTreeWidgetItem, max_depth: int = 6, depth: int = 0) -> None:
+    def selected_root_categories(self) -> list[CategoryTarget]:
+        """Checked top-level categories (for selective subcategory load)."""
+        targets: list[CategoryTarget] = []
+        for i in range(self.topLevelItemCount()):
+            item = self.topLevelItem(i)
+            if not (item.flags() & Qt.ItemFlag.ItemIsUserCheckable):
+                continue
+            if item.checkState(0) == Qt.CheckState.Unchecked:
+                continue
+            self._append_target(item, targets)
+        return targets
+
+    def _expand_item_branch(self, item: QTreeWidgetItem, max_depth: int = 2, depth: int = 0) -> None:
         if depth >= max_depth:
             return
         if item.data(0, self.ROLE_IS_PLACEHOLDER):
@@ -223,19 +272,50 @@ class FilterTreeWidget(QTreeWidget):
     def update_category_branch(self, node: FilterOptionNode) -> None:
         self._block_signals = True
         item = self._find_item_by_param_value(node.param_value)
-        new_item = self._create_option_item("Категория", node, depth=0)
+        depth = self._item_depth(item) if item is not None else 0
+        path_prefix = ""
+        if item is not None and item.parent() is not None:
+            path_prefix = str(
+                item.parent().data(0, self.ROLE_FULL_PATH)
+                or item.parent().data(0, self.ROLE_RAW_NAME)
+                or ""
+            )
+        new_item = self._create_option_item(
+            "Категория",
+            node,
+            depth=depth,
+            path_prefix=path_prefix,
+        )
         if item is None:
             self.addTopLevelItem(new_item)
         else:
             idx = self.indexOfTopLevelItem(item)
             if idx >= 0:
+                saved = item.checkState(0)
                 self.takeTopLevelItem(idx)
                 self.insertTopLevelItem(idx, new_item)
+                new_item.setCheckState(0, saved)
+            else:
+                parent = item.parent()
+                if parent is not None:
+                    idx = parent.indexOfChild(item)
+                    saved = item.checkState(0)
+                    parent.takeChild(idx)
+                    parent.insertChild(idx, new_item)
+                    new_item.setCheckState(0, saved)
+                else:
+                    self.addTopLevelItem(new_item)
         self._expand_item_branch(new_item)
         self._block_signals = False
         self.scrollToItem(new_item)
 
     def _finalize_subcategory_placeholders(self, item: QTreeWidgetItem) -> None:
+        # Roots the user did not expand keep the pending hint.
+        for i in range(item.childCount()):
+            child = item.child(i)
+            if child.data(0, self.ROLE_PENDING_SUBCATEGORIES):
+                return
+
         has_checkable_child = False
         for i in range(item.childCount()):
             child = item.child(i)
@@ -260,9 +340,48 @@ class FilterTreeWidget(QTreeWidget):
 
     def finalize_catalog_load(self, categories: list[FilterOptionNode]) -> None:
         self._block_signals = True
+        # Apply returned branches (source of truth), then clean placeholders.
+        for node in categories or []:
+            param = str(getattr(node, "param_value", "") or getattr(node, "category_id", "") or "")
+            if not param:
+                continue
+            item = self._find_item_by_param_value(param)
+            depth = self._item_depth(item) if item is not None else 0
+            path_prefix = ""
+            if item is not None and item.parent() is not None:
+                path_prefix = str(
+                    item.parent().data(0, self.ROLE_FULL_PATH)
+                    or item.parent().data(0, self.ROLE_RAW_NAME)
+                    or ""
+                )
+            new_item = self._create_option_item(
+                "Категория",
+                node,
+                depth=depth,
+                path_prefix=path_prefix,
+            )
+            if item is None:
+                self.addTopLevelItem(new_item)
+            else:
+                idx = self.indexOfTopLevelItem(item)
+                if idx >= 0:
+                    saved = item.checkState(0)
+                    self.takeTopLevelItem(idx)
+                    self.insertTopLevelItem(idx, new_item)
+                    new_item.setCheckState(0, saved)
+                else:
+                    # Non-top-level match: replace in place via parent.
+                    parent = item.parent()
+                    if parent is not None:
+                        idx = parent.indexOfChild(item)
+                        saved = item.checkState(0)
+                        parent.takeChild(idx)
+                        parent.insertChild(idx, new_item)
+                        new_item.setCheckState(0, saved)
         for i in range(self.topLevelItemCount()):
             self._finalize_subcategory_placeholders(self.topLevelItem(i))
             self._expand_item_branch(self.topLevelItem(i))
+        self._refresh_hierarchy_styles()
         self._block_signals = False
         self._emit_selection_count()
 
@@ -306,14 +425,114 @@ class FilterTreeWidget(QTreeWidget):
             parent = parent.parent()
         return depth
 
+    def _checkable_child_count(self, item: QTreeWidgetItem) -> int:
+        total = 0
+        for i in range(item.childCount()):
+            child = item.child(i)
+            if child.flags() & Qt.ItemFlag.ItemIsUserCheckable:
+                total += 1
+        return total
+
+    def _category_path_label(self, item: QTreeWidgetItem) -> str:
+        parts: list[str] = []
+        current: QTreeWidgetItem | None = item
+        while current is not None:
+            if current.flags() & Qt.ItemFlag.ItemIsUserCheckable:
+                parts.append(str(current.data(0, self.ROLE_RAW_NAME) or current.text(0)))
+            current = current.parent()
+        parts.reverse()
+        return " → ".join(parts)
+
+    def _immediate_parent_name(self, item: QTreeWidgetItem) -> str:
+        parent = item.parent()
+        while parent is not None:
+            if parent.flags() & Qt.ItemFlag.ItemIsUserCheckable:
+                return str(parent.data(0, self.ROLE_RAW_NAME) or parent.text(0) or "")
+            parent = parent.parent()
+        return str(item.data(0, self.ROLE_PARENT_NAME) or "")
+
+    def _format_category_label(
+        self,
+        name: str,
+        child_count: int,
+        depth: int,
+        parent_name: str = "",
+    ) -> str:
+        name = str(name or "").strip() or "Без названия"
+        if depth >= 2 and parent_name:
+            # Deep nodes keep affiliation visible even when the tree is busy.
+            label = f"↳ {name}  ← {parent_name}"
+        elif depth >= 1:
+            label = f"· {name}"
+        else:
+            label = name
+        if child_count > 0:
+            label = f"{label}  ({child_count})"
+        return label
+
+    def _apply_hierarchy_style(self, item: QTreeWidgetItem, depth: int) -> None:
+        if item.data(0, self.ROLE_IS_PLACEHOLDER):
+            return
+        child_count = self._checkable_child_count(item)
+        raw_name = str(item.data(0, self.ROLE_RAW_NAME) or item.text(0))
+        parent_name = self._immediate_parent_name(item)
+        path = self._category_path_label(item)
+        # While children are built they are not attached yet; keep precomputed path.
+        if item.parent() is None:
+            stored = str(item.data(0, self.ROLE_FULL_PATH) or "")
+            path = stored or path
+        item.setData(0, self.ROLE_DEPTH, depth)
+        item.setData(0, self.ROLE_FULL_PATH, path)
+        if parent_name:
+            item.setData(0, self.ROLE_PARENT_NAME, parent_name)
+        item.setText(
+            0,
+            self._format_category_label(raw_name, child_count, depth, parent_name),
+        )
+        tip = path if path == raw_name else f"{path}\nУровень: {depth + 1}"
+        if child_count:
+            tip += f"\nПрямых подкатегорий: {child_count}"
+        item.setToolTip(0, tip)
+
+        font = item.font(0)
+        font.setBold(depth == 0 or child_count > 0)
+        item.setFont(0, font)
+
+        if depth >= 2:
+            item.setForeground(0, QBrush(self._depth_muted))
+        elif depth == 1 and child_count == 0:
+            item.setForeground(0, QBrush(self._depth_soft))
+        else:
+            item.setForeground(0, QBrush())
+
+    def _refresh_hierarchy_styles(self, item: QTreeWidgetItem | None = None) -> None:
+        def walk(node: QTreeWidgetItem, depth: int) -> None:
+            self._apply_hierarchy_style(node, depth)
+            for i in range(node.childCount()):
+                child = node.child(i)
+                if child.data(0, self.ROLE_IS_PLACEHOLDER):
+                    continue
+                walk(child, depth + 1)
+
+        if item is not None:
+            walk(item, self._item_depth(item))
+            return
+        for i in range(self.topLevelItemCount()):
+            walk(self.topLevelItem(i), 0)
+
     def _create_option_item(
         self,
         section: str,
         node: FilterOptionNode,
         depth: int = -1,
+        path_prefix: str = "",
     ) -> QTreeWidgetItem:
-        display = node.name
-        item = QTreeWidgetItem([display])
+        raw_name = str(node.name or "").strip() or str(node.param_value or node.id or "")
+        immediate_parent = str(node.parent_name or "").strip()
+        if not immediate_parent and path_prefix:
+            immediate_parent = path_prefix.rsplit(" → ", 1)[-1]
+        full_path = raw_name if not path_prefix else f"{path_prefix} → {raw_name}"
+        item = QTreeWidgetItem([raw_name])
         item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
         item.setCheckState(0, Qt.CheckState.Unchecked)
         item.setData(0, self.ROLE_ID, node.id)
@@ -323,11 +542,22 @@ class FilterTreeWidget(QTreeWidget):
         item.setData(0, self.ROLE_PARAM_VALUE, node.param_value)
         item.setData(0, self.ROLE_CATEGORY_ID, node.category_id)
         item.setData(0, self.ROLE_CATEGORY_NAME, node.category_name)
-        item.setData(0, self.ROLE_PARENT_NAME, node.parent_name)
-        item.setData(0, self.ROLE_RAW_NAME, node.name)
+        item.setData(0, self.ROLE_PARENT_NAME, immediate_parent)
+        item.setData(0, self.ROLE_RAW_NAME, raw_name)
+        item.setData(0, self.ROLE_DEPTH, max(depth, 0))
+        item.setData(0, self.ROLE_FULL_PATH, full_path)
+
         child_depth = depth + 1 if depth >= 0 else -1
         for child in node.children:
-            item.addChild(self._create_option_item(section, child, depth=child_depth))
+            item.addChild(
+                self._create_option_item(
+                    section,
+                    child,
+                    depth=child_depth if child_depth >= 0 else 1,
+                    path_prefix=full_path,
+                )
+            )
+        self._apply_hierarchy_style(item, depth if depth >= 0 else 0)
         return item
 
     def can_rename_item(self, item: QTreeWidgetItem | None) -> bool:
@@ -345,15 +575,19 @@ class FilterTreeWidget(QTreeWidget):
             return False
 
         old_name = str(item.data(0, self.ROLE_RAW_NAME) or item.text(0))
-        item.setText(0, name)
         item.setData(0, self.ROLE_RAW_NAME, name)
         item.setData(0, self.ROLE_CATEGORY_NAME, name)
 
-        # Direct children use this value when building labels for parsing/export.
+        # Keep direct children's parent link in sync for labels/export.
         for index in range(item.childCount()):
             child = item.child(index)
-            if str(child.data(0, self.ROLE_PARENT_NAME) or "") == old_name:
+            if not (child.flags() & Qt.ItemFlag.ItemIsUserCheckable):
+                continue
+            child_parent = str(child.data(0, self.ROLE_PARENT_NAME) or "")
+            if child_parent in ("", old_name):
                 child.setData(0, self.ROLE_PARENT_NAME, name)
+        # Refresh this node and descendants so paths/tooltips stay correct.
+        self._refresh_hierarchy_styles(item)
         return True
 
     def _on_item_changed(self, item: QTreeWidgetItem, _column: int) -> None:
@@ -410,12 +644,19 @@ class FilterTreeWidget(QTreeWidget):
         option_id = item.data(0, self.ROLE_ID)
         if not option_id:
             return
-        parent_name = str(item.data(0, self.ROLE_PARENT_NAME) or "")
+        parent_name = str(
+            item.data(0, self.ROLE_PARENT_NAME) or self._immediate_parent_name(item) or ""
+        )
         cat_id = str(item.data(0, self.ROLE_CATEGORY_ID) or item.data(0, self.ROLE_PARAM_VALUE) or "")
         section = str(item.data(0, self.ROLE_SECTION) or "")
-        display = str(item.data(0, self.ROLE_RAW_NAME) or item.text(0))
-        if parent_name and section == "Категория":
-            display = f"{parent_name} → {display}"
+        raw_name = str(item.data(0, self.ROLE_RAW_NAME) or item.text(0))
+        full_path = str(item.data(0, self.ROLE_FULL_PATH) or self._category_path_label(item) or "")
+        display = raw_name
+        if section == "Категория":
+            if " → " in full_path:
+                display = full_path
+            elif parent_name:
+                display = f"{parent_name} → {raw_name}"
         targets.append(
             CategoryTarget(
                 id=str(option_id),
@@ -425,7 +666,7 @@ class FilterTreeWidget(QTreeWidget):
                 param_key=str(item.data(0, self.ROLE_PARAM_KEY) or ""),
                 param_value=str(item.data(0, self.ROLE_PARAM_VALUE) or ""),
                 category_id=cat_id,
-                category_name=str(item.data(0, self.ROLE_CATEGORY_NAME) or display),
+                category_name=str(item.data(0, self.ROLE_CATEGORY_NAME) or raw_name),
                 parent_name=parent_name,
             )
         )
@@ -519,12 +760,14 @@ class LoadCategoriesWorker(QThread):
         browser_mode: BrowserMode = DESKTOP_MODE,
         use_auth: bool = False,
         specific_seller: bool = True,
+        roots_only: bool = True,
     ):
         super().__init__()
         self.seller_url = seller_url
         self.browser_mode = browser_mode
         self.use_auth = use_auth
         self.specific_seller = specific_seller
+        self.roots_only = roots_only
         self._bypass_event: threading.Event | None = None
 
     def resume_manual_bypass(self) -> None:
@@ -555,10 +798,87 @@ class LoadCategoriesWorker(QThread):
                 on_subcategories_begin=lambda total: self.subcategories_begin.emit(total),
                 on_branch=lambda node: self.branch_loaded.emit(node),
                 specific_seller=self.specific_seller,
+                prefer_cache=not self.roots_only,
+                roots_only=self.roots_only,
             )
             self.finished_ok.emit(categories)
         except Exception as exc:
             self.failed.emit(str(exc))
+
+
+class LoadSubcategoriesWorker(QThread):
+    finished_ok = pyqtSignal(list)
+    failed = pyqtSignal(str)
+    progress = pyqtSignal(str)
+    subcategories_begin = pyqtSignal(int)
+    branch_loaded = pyqtSignal(object)
+    manual_bypass_needed = pyqtSignal(str)
+
+    def __init__(
+        self,
+        seller_url: str,
+        categories: list[CategoryTarget],
+        browser_mode: BrowserMode = DESKTOP_MODE,
+        use_auth: bool = False,
+        specific_seller: bool = False,
+    ):
+        super().__init__()
+        self.seller_url = seller_url
+        self.categories = categories
+        self.browser_mode = browser_mode
+        self.use_auth = use_auth
+        self.specific_seller = specific_seller
+        self._bypass_event: threading.Event | None = None
+        self._parser: OzonParser | None = None
+        self._cancelled = False
+
+    def cancel(self) -> None:
+        self._cancelled = True
+        if self._parser:
+            self._parser.stop()
+
+    def resume_manual_bypass(self) -> None:
+        if self._bypass_event:
+            self._bypass_event.set()
+
+    def run(self) -> None:
+        import threading
+
+        self._bypass_event = threading.Event()
+
+        def on_manual_bypass(incident: str | None) -> bool:
+            self.manual_bypass_needed.emit(incident or "")
+            self._bypass_event.clear()
+            return self._bypass_event.wait(timeout=600)
+
+        try:
+            parser = OzonParser(
+                on_progress=lambda msg: self.progress.emit(msg),
+                on_manual_bypass=on_manual_bypass,
+            )
+            self._parser = parser
+            branches: list = []
+            self.subcategories_begin.emit(len(self.categories))
+            for target in self.categories:
+                if self._cancelled:
+                    break
+                batch = parser.expand_selected_category_subtrees(
+                    [target],
+                    seller_url=self.seller_url,
+                    use_auth=self.use_auth,
+                    use_cdp=self.browser_mode == DESKTOP_MODE,
+                    browser_mode=self.browser_mode,
+                    specific_seller=self.specific_seller,
+                    on_branch=lambda node: self.branch_loaded.emit(node),
+                )
+                branches.extend(batch)
+            if not self._cancelled:
+                self.finished_ok.emit(branches)
+        except Exception as exc:
+            if not self._cancelled:
+                self.failed.emit(str(exc))
+        finally:
+            self._parser = None
 
 
 class ParseWorker(QThread):
@@ -668,14 +988,20 @@ class MainWindow(QMainWindow):
         self.parser: OzonParser | None = None
         self.parse_worker: ParseWorker | None = None
         self.category_worker: LoadCategoriesWorker | None = None
+        self.subcategory_worker: LoadSubcategoriesWorker | None = None
         self.mobile_login_worker: MobileLoginWorker | None = None
         self._parsed_products: list = []
         self._parsed_filepath: str = ""
         self._last_export_meta: ExportMeta | None = None
         self._catalog_subcat_total = 0
+        self._roots_loaded = False
         self._loaded_category_mode: BrowserMode | None = None
         self._loaded_category_auth: bool | None = None
-        self._loaded_specific_seller: bool | None = None
+        self._loaded_category_scope: str | None = None
+        self._loaded_parse_mode: ParseMode | None = None
+        self._subcat_queue: list[CategoryTarget] = []
+        self._subcat_loaded_ids: set[str] = set()
+        self._subcat_in_progress_ids: set[str] = set()
         self._theme: ThemeName = load_theme_preference()
 
         self.setWindowTitle("Ozon Parser — Баллы за отзыв")
@@ -732,16 +1058,31 @@ class MainWindow(QMainWindow):
         params_layout = QVBoxLayout(params_group)
         params_layout.setSpacing(14)
 
-        self.specific_seller_checkbox = QCheckBox("Парсить конкретный магазин")
-        self.specific_seller_checkbox.setChecked(False)
-        self.specific_seller_checkbox.setToolTip(
-            "Включено — товары только указанного продавца. "
-            "Выключено — товары всех продавцов Ozon."
+        self.parse_mode_combo = QComboBox()
+        self.parse_mode_combo.addItem(
+            "Выбранные категории — весь Ozon (без магазина)",
+            PARSE_MODE_GLOBAL_CATEGORIES,
         )
-        self.specific_seller_checkbox.toggled.connect(
-            self._on_specific_seller_changed
+        self.parse_mode_combo.addItem(
+            "Все магазины — только выбранные категории",
+            PARSE_MODE_ALL_SELLERS_CATEGORIES,
         )
-        params_layout.addWidget(self.specific_seller_checkbox)
+        self.parse_mode_combo.addItem(
+            "Все магазины — полный каталог каждого",
+            PARSE_MODE_ALL_SELLERS_FULL,
+        )
+        self.parse_mode_combo.addItem(
+            "Конкретный магазин — все товары",
+            PARSE_MODE_SELLER_FULL,
+        )
+        self.parse_mode_combo.addItem(
+            "Конкретный магазин — выбранные категории",
+            PARSE_MODE_SELLER_CATEGORIES,
+        )
+        self.parse_mode_combo.setCurrentIndex(0)
+        self.parse_mode_combo.currentIndexChanged.connect(self._on_parse_mode_changed)
+        params_layout.addWidget(QLabel("Режим парсинга"))
+        params_layout.addWidget(self.parse_mode_combo)
 
         self.seller_label = QLabel("Ссылка на продавца")
         self.seller_label.setEnabled(False)
@@ -750,7 +1091,7 @@ class MainWindow(QMainWindow):
         self.seller_input.clear()
         self.seller_input.setEnabled(False)
         self.seller_input.setPlaceholderText(
-            "Не требуется — будут товары всех продавцов"
+            "Не требуется — общий каталог Ozon"
         )
         params_layout.addWidget(self.seller_input)
 
@@ -785,13 +1126,26 @@ class MainWindow(QMainWindow):
         price_row.addLayout(price_col_r)
         params_layout.addLayout(price_row)
 
-        params_layout.addWidget(QLabel("Количество товаров с баллами (на категорию)"))
+        params_layout.addWidget(QLabel("Какие товары собирать"))
+        self.product_filter_combo = QComboBox()
+        self.product_filter_combo.addItem("Только с баллами за отзыв", True)
+        self.product_filter_combo.addItem("Все товары", False)
+        self.product_filter_combo.setCurrentIndex(0)
+        self.product_filter_combo.setToolTip(
+            "«Только с баллами» — в XLSX попадут товары с акцией за отзыв на карточке.\n"
+            "«Все товары» — любые товары из выбранных категорий в диапазоне цен."
+        )
+        self.product_filter_combo.currentIndexChanged.connect(self._on_product_filter_changed)
+        params_layout.addWidget(self.product_filter_combo)
+
+        self.max_products_label = QLabel("Количество товаров с баллами (на категорию)")
+        params_layout.addWidget(self.max_products_label)
         self.max_products = QSpinBox()
         self.max_products.setRange(1, 100000)
         self.max_products.setValue(100)
         self.max_products.setToolTip(
             "До 10000+ за один запуск: парсер сам делает автопаузы "
-            "каждые 25 товаров и длинные паузы каждые 400, "
+            "каждые 25 товаров и каждые 400 (до 25 сек), "
             "чтобы снизить риск fab_/«нет соединения»."
         )
         params_layout.addWidget(self.max_products)
@@ -848,7 +1202,10 @@ class MainWindow(QMainWindow):
         cat_inner.setSpacing(pad)
 
         cat_header = QHBoxLayout()
-        cat_hint = QLabel("Загружается полная иерархия категорий магазина Ozon. Отметьте нужные и запустите парсер.")
+        cat_hint = QLabel(
+            "Дерево категорий: сверху главные разделы, внутри — вложенные. "
+            "Наведите на пункт, чтобы увидеть полный путь. Отметьте нужные и запустите парсер."
+        )
         cat_hint.setObjectName("CatalogHint")
         cat_hint.setWordWrap(True)
         cat_header.addWidget(cat_hint, stretch=1)
@@ -902,6 +1259,17 @@ class MainWindow(QMainWindow):
         setup_action_button(self.load_cat_btn, min_height=44)
         cat_inner.addWidget(self.load_cat_btn)
 
+        self.load_subcat_btn = QPushButton("Загрузить подкатегории")
+        self.load_subcat_btn.setEnabled(False)
+        self.load_subcat_btn.setToolTip(
+            "Отметьте главные категории, затем загрузите подкатегории. "
+            "Для магазина — только категории этого магазина, полная глубина "
+            "с «Посмотреть все» на каждом уровне."
+        )
+        self.load_subcat_btn.clicked.connect(self.load_selected_subcategories)
+        setup_action_button(self.load_subcat_btn, min_height=44)
+        cat_inner.addWidget(self.load_subcat_btn)
+
         catalog_layout.addWidget(catalog_group, stretch=1)
 
         main_row.addWidget(catalog_wrap, stretch=46)
@@ -947,6 +1315,7 @@ class MainWindow(QMainWindow):
         self._apply_styles()
         self._set_app_status(self.STATUS_IDLE, parsing=False)
         self._update_download_button()
+        self._on_parse_mode_changed()
 
     def _set_app_status(self, text: str, *, parsing: bool = False) -> None:
         self.app_status_label.setText(text)
@@ -960,16 +1329,37 @@ class MainWindow(QMainWindow):
     def _selected_use_auth(self) -> bool:
         return bool(self.auth_mode_combo.currentData())
 
-    def _selected_specific_seller(self) -> bool:
-        return self.specific_seller_checkbox.isChecked()
+    def _selected_parse_mode(self) -> ParseMode:
+        return self.parse_mode_combo.currentData()
 
-    def _on_specific_seller_changed(self, checked: bool) -> None:
-        self.seller_label.setEnabled(checked)
-        self.seller_input.setEnabled(checked)
+    def _selected_bonus_only(self) -> bool:
+        return bool(self.product_filter_combo.currentData())
+
+    def _on_product_filter_changed(self, _index: int = 0) -> None:
+        if self._selected_bonus_only():
+            self.max_products_label.setText("Количество товаров с баллами (на категорию)")
+        else:
+            self.max_products_label.setText("Количество товаров (на категорию)")
+
+    def _parse_mode_requires_seller_url(self, mode: ParseMode | None = None) -> bool:
+        mode = mode or self._selected_parse_mode()
+        return mode in SELLER_PARSE_MODES
+
+    def _parse_mode_requires_categories(self, mode: ParseMode | None = None) -> bool:
+        mode = mode or self._selected_parse_mode()
+        return mode in CATEGORY_REQUIRED_PARSE_MODES
+
+    def _category_tree_scope(self) -> str:
+        return "seller" if self._parse_mode_requires_seller_url() else "global"
+
+    def _on_parse_mode_changed(self, _index: int = 0) -> None:
+        needs_seller = self._parse_mode_requires_seller_url()
+        self.seller_label.setEnabled(needs_seller)
+        self.seller_input.setEnabled(needs_seller)
         self.seller_input.setPlaceholderText(
             "https://www.ozon.ru/seller/..."
-            if checked
-            else "Не требуется — будут товары всех продавцов"
+            if needs_seller
+            else "Не требуется — общий каталог Ozon"
         )
         self._on_session_mode_changed()
 
@@ -994,14 +1384,20 @@ class MainWindow(QMainWindow):
             and (
                 self._loaded_category_mode != self._selected_browser_mode()
                 or self._loaded_category_auth != self._selected_use_auth()
-                or self._loaded_specific_seller != self._selected_specific_seller()
+                or self._loaded_category_scope != self._category_tree_scope()
             )
         ):
             self.category_tree.clear()
             self._update_selected_categories_count(0)
             self._loaded_category_mode = None
             self._loaded_category_auth = None
-            self._loaded_specific_seller = None
+            self._loaded_category_scope = None
+            self._loaded_parse_mode = None
+            self._roots_loaded = False
+            self._subcat_queue.clear()
+            self._subcat_loaded_ids.clear()
+            self._subcat_in_progress_ids.clear()
+            self.load_subcat_btn.setEnabled(False)
             message = "Режим изменён — загрузите категории заново"
             self.status_label.setText(message)
             self._append_log(message)
@@ -1058,7 +1454,9 @@ class MainWindow(QMainWindow):
             )
         )
         if hasattr(self, "category_tree"):
-            self.category_tree.set_placeholder_color(THEMES[theme].placeholder)
+            colors = THEMES[theme]
+            self.category_tree.set_placeholder_color(colors.placeholder)
+            self.category_tree.set_hierarchy_colors(colors.text_muted, colors.text_soft)
 
     def _refresh_theme_button(self) -> None:
         if self._theme == "light":
@@ -1214,6 +1612,8 @@ class MainWindow(QMainWindow):
         self._show_manual_bypass_dialog(incident)
         if self.category_worker:
             self.category_worker.resume_manual_bypass()
+        if self.subcategory_worker:
+            self.subcategory_worker.resume_manual_bypass()
 
     def _on_parse_manual_bypass(self, incident: str) -> None:
         self._show_manual_bypass_dialog(incident)
@@ -1272,10 +1672,14 @@ class MainWindow(QMainWindow):
                 f"Категория переименована: «{current_name}» → «{item.text(0)}»"
             )
 
+    def _root_target_id(self, target: CategoryTarget) -> str:
+        return str(target.param_value or target.category_id or target.id)
+
     def load_categories(self) -> None:
-        specific_seller = self._selected_specific_seller()
-        url = self.seller_input.text().strip() if specific_seller else ""
-        if specific_seller and not url:
+        scope = self._category_tree_scope()
+        needs_seller = self._parse_mode_requires_seller_url()
+        url = self.seller_input.text().strip() if needs_seller else ""
+        if needs_seller and not url:
             QMessageBox.warning(
                 self,
                 "Ссылка не указана",
@@ -1284,37 +1688,120 @@ class MainWindow(QMainWindow):
             return
         if not self._validate_mobile_auth():
             return
+        if self.subcategory_worker and self.subcategory_worker.isRunning():
+            QMessageBox.information(
+                self,
+                "Загрузка идёт",
+                "Дождитесь окончания загрузки подкатегорий.",
+            )
+            return
         browser_mode = self._selected_browser_mode()
         use_auth = self._selected_use_auth()
         self._catalog_subcat_total = 0
+        self._roots_loaded = False
         self.load_cat_btn.setEnabled(False)
+        self.load_subcat_btn.setEnabled(False)
         self.start_btn.setEnabled(False)
-        self.specific_seller_checkbox.setEnabled(False)
+        self.parse_mode_combo.setEnabled(False)
         self.rename_cat_btn.setEnabled(False)
-        self.status_label.setText("Загрузка категорий...")
+        self._subcat_queue.clear()
+        self._subcat_loaded_ids.clear()
+        self._subcat_in_progress_ids.clear()
+        self.status_label.setText("Загрузка главных категорий...")
         self._append_log(
-            "Загрузка категорий магазина..."
-            if specific_seller
-            else "Загрузка общего каталога Ozon (все продавцы)..."
+            "Загрузка главных категорий магазина..."
+            if scope == "seller"
+            else "Загрузка главных категорий общего каталога Ozon..."
         )
         self.category_tree.begin_incremental_load()
         self.category_worker = LoadCategoriesWorker(
             url,
             browser_mode=browser_mode,
             use_auth=use_auth,
-            specific_seller=specific_seller,
+            specific_seller=(scope == "seller"),
+            roots_only=True,
         )
         self._loaded_category_mode = browser_mode
         self._loaded_category_auth = use_auth
-        self._loaded_specific_seller = specific_seller
+        self._loaded_category_scope = scope
+        self._loaded_parse_mode = self._selected_parse_mode()
         self.category_worker.progress.connect(self._on_worker_progress)
         self.category_worker.roots_loaded.connect(self._on_category_roots_loaded)
-        self.category_worker.subcategories_begin.connect(self._on_subcategories_begin)
-        self.category_worker.branch_loaded.connect(self._on_category_branch_loaded)
         self.category_worker.manual_bypass_needed.connect(self._on_category_manual_bypass)
-        self.category_worker.finished_ok.connect(self._on_categories_loaded)
+        self.category_worker.finished_ok.connect(self._on_root_categories_loaded)
         self.category_worker.failed.connect(self._on_categories_failed)
         self.category_worker.start()
+
+    def load_selected_subcategories(self) -> None:
+        roots = self.category_tree.selected_root_categories()
+        if not roots:
+            QMessageBox.warning(
+                self,
+                "Категории не выбраны",
+                "Отметьте галочками главные категории, для которых нужны подкатегории.",
+            )
+            return
+        self._start_subcategory_worker(roots)
+
+    def _start_subcategory_worker(
+        self,
+        roots: list[CategoryTarget],
+    ) -> None:
+        if not roots:
+            return
+        if not self._validate_mobile_auth():
+            return
+        if self.category_worker and self.category_worker.isRunning():
+            QMessageBox.information(
+                self,
+                "Загрузка идёт",
+                "Дождитесь окончания загрузки главных категорий.",
+            )
+            return
+        if self.subcategory_worker and self.subcategory_worker.isRunning():
+            QMessageBox.information(
+                self,
+                "Загрузка идёт",
+                "Дождитесь окончания текущей загрузки подкатегорий.",
+            )
+            return
+        scope = self._category_tree_scope()
+        needs_seller = self._parse_mode_requires_seller_url()
+        url = self.seller_input.text().strip() if needs_seller else ""
+        if needs_seller and not url:
+            QMessageBox.warning(
+                self,
+                "Ссылка не указана",
+                "Для режима конкретного магазина укажите ссылку на продавца.",
+            )
+            return
+        browser_mode = self._selected_browser_mode()
+        use_auth = self._selected_use_auth()
+        self.load_cat_btn.setEnabled(False)
+        self.load_subcat_btn.setEnabled(False)
+        self.parse_mode_combo.setEnabled(False)
+        self.rename_cat_btn.setEnabled(False)
+        for target in roots:
+            self._subcat_in_progress_ids.add(self._root_target_id(target))
+        names = ", ".join((t.name or t.id) for t in roots[:5])
+        if len(roots) > 5:
+            names += f" и ещё {len(roots) - 5}"
+        self.status_label.setText(f"Загрузка подкатегорий: {len(roots)} раздел(ов)...")
+        self._append_log(f"Загрузка подкатегорий только для: {names}")
+        self.subcategory_worker = LoadSubcategoriesWorker(
+            url,
+            roots,
+            browser_mode=browser_mode,
+            use_auth=use_auth,
+            specific_seller=(scope == "seller"),
+        )
+        self.subcategory_worker.progress.connect(self._on_worker_progress)
+        self.subcategory_worker.subcategories_begin.connect(self._on_subcategories_begin)
+        self.subcategory_worker.branch_loaded.connect(self._on_category_branch_loaded)
+        self.subcategory_worker.manual_bypass_needed.connect(self._on_category_manual_bypass)
+        self.subcategory_worker.finished_ok.connect(self._on_subcategories_loaded)
+        self.subcategory_worker.failed.connect(self._on_subcategories_failed)
+        self.subcategory_worker.start()
 
     def _count_subcategories(self, nodes: list) -> int:
         def count_descendants(node) -> int:
@@ -1326,86 +1813,103 @@ class MainWindow(QMainWindow):
         return sum(count_descendants(node) for node in nodes)
 
     def _on_category_roots_loaded(self, roots: list) -> None:
-        self.category_tree.set_initial_roots(roots)
+        self.category_tree.begin_incremental_load()
+        self.category_tree.set_initial_roots(roots, pending_subcategories=True)
         self.status_label.setText(
-            f"Категории отображены ({len(roots)}). Подкатегории загружаются..."
+            f"Главные категории загружены ({len(roots)}). "
+            "Отметьте нужные и нажмите «Загрузить подкатегории»."
         )
-        self._append_log(f"Категории отображены: {len(roots)}")
+        self._append_log(f"Главные категории: {len(roots)}")
+
+    def _on_root_categories_loaded(self, categories: list) -> None:
+        if not self.category_tree.topLevelItemCount() and categories:
+            self.category_tree.set_initial_roots(categories, pending_subcategories=True)
+        self._roots_loaded = True
+        self.load_cat_btn.setEnabled(True)
+        self.load_subcat_btn.setEnabled(True)
+        self.start_btn.setEnabled(True)
+        self.parse_mode_combo.setEnabled(True)
+        self._update_rename_category_button(self.category_tree.currentItem())
+        self.status_label.setText(
+            f"Главных категорий: {len(categories)}. "
+            "Отметьте разделы → «Загрузить подкатегории»."
+        )
+        self._append_log(
+            "Шаг 1 готов. Отметьте нужные категории галочками, затем нажмите "
+            "«Загрузить подкатегории». Парсинг можно запускать после загрузки нужных веток."
+        )
 
     def _on_subcategories_begin(self, total: int) -> None:
         self._catalog_subcat_total = total
         self._catalog_subcat_done = 0
-        if self._loaded_specific_seller is False:
-            self._append_log(
-                f"Полный обход всех веток каталога: {total} корневых категорий..."
-            )
-        else:
-            self._append_log(
-                f"Загрузка подкатегорий для {total} категорий (до 15 мин)..."
-            )
+        self._append_log(f"Загрузка подкатегорий для {total} выбранных разделов...")
 
     def _on_category_branch_loaded(self, node) -> None:
         self.category_tree.update_category_branch(node)
-
-    def _on_categories_loaded(self, categories: list) -> None:
-        self.category_tree.finalize_catalog_load(categories)
-        self.category_tree.expandToDepth(4)
-        self.load_cat_btn.setEnabled(True)
-        self.start_btn.setEnabled(True)
-        self.specific_seller_checkbox.setEnabled(True)
-        self._update_rename_category_button(self.category_tree.currentItem())
-        sub_count = self._count_subcategories(categories)
-        total = self._catalog_subcat_total or len(categories)
-        with_subcats = sum(1 for c in categories if c.children)
-        cooldown_min = max(1, int(POST_CATALOG_PARSE_COOLDOWN_HINT_SEC // 60))
-        if self._loaded_specific_seller is False:
+        name = str(getattr(node, "name", "") or "")
+        child_n = len(getattr(node, "children", []) or [])
+        total = self._catalog_subcat_total or 0
+        if total:
             self.status_label.setText(
-                f"Полный каталог загружен: {len(categories)} разделов, "
-                f"{sub_count} подкатегорий/веток. Пауза {cooldown_min} мин перед парсингом "
-                "снижает риск «нет соединения» / fab_."
-            )
-            self._append_log(
-                f"Рекомендация: подождите ~{cooldown_min} мин. Не жмите F5 в Chrome. "
-                "Каталог уже в дереве/кэше — можно закрыть вкладку Ozon и позже "
-                "отметить категории и запустить парсер."
-            )
-            QMessageBox.information(
-                self,
-                "Каталог загружен — длинная пауза перед парсингом",
-                (
-                    f"Полный каталог собран ({len(categories)} разделов).\n\n"
-                    f"После сбора Composer Ozon часто показывает "
-                    f"«Похоже, нет соединения» / fab_ — это не ошибка интернета.\n\n"
-                    f"Подождите около {cooldown_min} минут:\n"
-                    f"• не обновляйте страницу (F5 ухудшает бан)\n"
-                    f"• вкладку можно оставить на about:blank или закрыть\n"
-                    f"• затем отметьте категории и запустите парсер\n\n"
-                    f"Повторная «Загрузить категории» возьмёт дерево из кэша "
-                    f"без новых запросов, пока кэш свежий."
-                ),
-            )
-        elif total and with_subcats < total:
-            self.status_label.setText(
-                f"Категории частично загружены: подкатегории для {with_subcats}/{total} разделов."
-            )
-            self._append_log(
-                f"Лимит 15 мин: подкатегории собраны для {with_subcats}/{total} категорий"
+                f"Подкатегории: сбор «{name}» ({child_n} прямых)…"
             )
         else:
-            self.status_label.setText(
-                f"Категории загружены: {len(categories)} разделов, {sub_count} подкатегорий. "
-                "Отметьте нужные и запустите парсер."
-            )
-        self._append_log(f"Итого: {len(categories)} категорий, {sub_count} подкатегорий")
+            self.status_label.setText(f"Подкатегории: «{name}» ({child_n})")
+
+    def _on_subcategories_loaded(self, branches: list) -> None:
+        self.category_tree.finalize_catalog_load(branches)
+        self.category_tree.expandToDepth(2)
+        for node in branches:
+            root_id = str(getattr(node, "param_value", "") or getattr(node, "category_id", "") or "")
+            if root_id:
+                self._subcat_loaded_ids.add(root_id)
+                self._subcat_in_progress_ids.discard(root_id)
+        self.load_cat_btn.setEnabled(True)
+        self.load_subcat_btn.setEnabled(True)
+        self.start_btn.setEnabled(True)
+        self.parse_mode_combo.setEnabled(True)
+        self._update_rename_category_button(self.category_tree.currentItem())
+        sub_count = self._count_subcategories(branches)
+        self.status_label.setText(
+            f"Подкатегории загружены для {len(branches)} раздел(ов), "
+            f"внутри узлов: {sub_count}. Можно парсить."
+        )
+        self._append_log(
+            f"Подкатегории готовы: {len(branches)} веток, {sub_count} узлов"
+        )
+        self._update_selected_categories_count(
+            len(self.category_tree.selected_leaf_categories())
+        )
+
+    def _on_subcategories_failed(self, error: str) -> None:
+        self._subcat_in_progress_ids.clear()
+        self.load_cat_btn.setEnabled(True)
+        self.load_subcat_btn.setEnabled(self._roots_loaded)
+        self.start_btn.setEnabled(True)
+        self.parse_mode_combo.setEnabled(True)
+        self._update_rename_category_button(self.category_tree.currentItem())
+        self.status_label.setText(f"Ошибка загрузки подкатегорий: {error}")
+        hint = (
+            "Ozon заблокировал доступ (это не ошибка интернета).\n\n"
+            "Подождите 15–30 минут без F5, затем снова нажмите "
+            "«Загрузить подкатегории» для выбранных разделов."
+        )
+        if "нет соединения" in error.lower() or "заблокировал" in error.lower():
+            QMessageBox.warning(self, "Блокировка Ozon", hint)
+        else:
+            QMessageBox.warning(self, "Ошибка", error)
 
     def _on_categories_failed(self, error: str) -> None:
         self.load_cat_btn.setEnabled(True)
+        self.load_subcat_btn.setEnabled(False)
         self.start_btn.setEnabled(True)
-        self.specific_seller_checkbox.setEnabled(True)
+        self.parse_mode_combo.setEnabled(True)
         self._update_rename_category_button(self.category_tree.currentItem())
         self._loaded_category_mode = None
         self._loaded_category_auth = None
-        self._loaded_specific_seller = None
+        self._loaded_category_scope = None
+        self._loaded_parse_mode = None
+        self._roots_loaded = False
         self.status_label.setText(f"Ошибка загрузки категорий: {error}")
         hint = (
             "Ozon заблокировал доступ (это не ошибка интернета).\n\n"
@@ -1430,33 +1934,40 @@ class MainWindow(QMainWindow):
         self.start_parsing()
 
     def start_parsing(self) -> None:
-        specific_seller = self._selected_specific_seller()
-        url = self.seller_input.text().strip() if specific_seller else ""
-        if specific_seller and not url:
+        parse_mode = self._selected_parse_mode()
+        needs_seller = self._parse_mode_requires_seller_url(parse_mode)
+        needs_categories = self._parse_mode_requires_categories(parse_mode)
+        url = self.seller_input.text().strip() if needs_seller else ""
+        if needs_seller and not url:
             QMessageBox.warning(
                 self,
                 "Ссылка не указана",
-                "Укажите ссылку на продавца для запуска парсера.",
+                "Укажите ссылку на продавца для выбранного режима парсинга.",
             )
             return
         if not self._validate_mobile_auth():
             return
+        if self.subcategory_worker and self.subcategory_worker.isRunning():
+            self._append_log(
+                "Останавливаем догрузку подкатегорий — запускаем парсинг выбранного."
+            )
+            self.subcategory_worker.cancel()
         browser_mode = self._selected_browser_mode()
         use_auth = self._selected_use_auth()
-        if (
+        if needs_categories and (
             self._loaded_category_mode != browser_mode
             or self._loaded_category_auth != use_auth
-            or self._loaded_specific_seller != specific_seller
+            or self._loaded_category_scope != self._category_tree_scope()
         ):
             QMessageBox.warning(
                 self,
                 "Категории устарели",
-                "Загрузите категории заново для выбранного режима и охвата магазинов.",
+                "Загрузите категории заново для выбранного режима парсинга.",
             )
             return
 
-        categories = self.category_tree.selected_leaf_categories()
-        if not categories:
+        categories = self.category_tree.selected_leaf_categories() if needs_categories else []
+        if needs_categories and not categories:
             QMessageBox.warning(
                 self,
                 "Ничего не выбрано",
@@ -1464,7 +1975,7 @@ class MainWindow(QMainWindow):
             )
             return
 
-        if not specific_seller and len(categories) >= 50:
+        if parse_mode == PARSE_MODE_GLOBAL_CATEGORIES and len(categories) >= 50:
             goal = self.max_products.value()
             self._append_log(
                 f"Выбрано категорий: {len(categories)}. Цель: {goal} товаров. "
@@ -1477,10 +1988,10 @@ class MainWindow(QMainWindow):
                     f"Выбрано {len(categories)} категорий общего каталога.\n"
                     f"Цель: {goal} товаров за один запуск.\n\n"
                     "Парсер будет работать непрерывно с автопаузами:\n"
-                    "• каждые 25 товаров\n"
-                    "• длинная пауза каждые 400 товаров\n"
-                    "• пауза после каждой волны категорий\n"
-                    "• ожидание разбана без F5 при fab_\n\n"
+                    "• каждые 25 товаров (до 22 сек)\n"
+                    "• каждые 400 товаров (до 25 сек)\n"
+                    "• пауза волны категорий (до 25 сек)\n"
+                    "• ожидание fab_ без F5 (до 90 сек)\n\n"
                     "Это может занять много часов. Не обновляйте Chrome вручную.\n\n"
                     "Продолжить?"
                 ),
@@ -1511,7 +2022,7 @@ class MainWindow(QMainWindow):
 
         settings = ParseSettings(
             seller_url=url,
-            categories=categories,
+            categories=categories or None,
             min_price=min_p,
             max_price=max_p,
             max_products=self.max_products.value(),
@@ -1519,7 +2030,23 @@ class MainWindow(QMainWindow):
             import_browser_session=browser_mode == DESKTOP_MODE,
             use_cdp=browser_mode == DESKTOP_MODE,
             browser_mode=browser_mode,
-            specific_seller=specific_seller,
+            parse_mode=parse_mode,
+            bonus_only=self._selected_bonus_only(),
+        )
+
+        mode_labels = {
+            PARSE_MODE_GLOBAL_CATEGORIES: "Выбранные категории (весь Ozon)",
+            PARSE_MODE_ALL_SELLERS_CATEGORIES: "Все магазины × выбранные категории",
+            PARSE_MODE_ALL_SELLERS_FULL: "Все магазины × полный каталог",
+            PARSE_MODE_SELLER_FULL: "Магазин × все товары",
+            PARSE_MODE_SELLER_CATEGORIES: "Магазин × выбранные категории",
+        }
+        export_meta = ExportMeta(
+            seller_url=url if needs_seller else "Все магазины Ozon",
+            min_price=min_p,
+            max_price=max_p,
+            max_products=self.max_products.value(),
+            categories=self._selected_targets_label(categories) if categories else "—",
         )
 
         resume_info = describe_checkpoint(settings)
@@ -1544,14 +2071,6 @@ class MainWindow(QMainWindow):
             self._append_log(
                 "Старый файл прогресса не подходит к текущим параметрам и будет игнорирован"
             )
-
-        export_meta = ExportMeta(
-            seller_url=url if specific_seller else "Все магазины Ozon",
-            min_price=min_p,
-            max_price=max_p,
-            max_products=self.max_products.value(),
-            categories=self._selected_targets_label(categories),
-        )
 
         self._reset_parse_display()
         self.log_view.clear()
@@ -1580,8 +2099,12 @@ class MainWindow(QMainWindow):
             return "—"
         labels: list[str] = []
         for target in categories:
-            prefix = f"{target.parent_name} → " if target.parent_name else ""
-            labels.append(f"{prefix}{target.name}")
+            if " → " in (target.name or ""):
+                labels.append(target.name)
+            elif target.parent_name:
+                labels.append(f"{target.parent_name} → {target.name}")
+            else:
+                labels.append(target.name)
         return ", ".join(labels)
 
     def _on_captcha(self) -> None:
