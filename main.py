@@ -20,6 +20,12 @@ def _prepare_runtime() -> None:
 
 def _show_startup_error(exc: BaseException) -> None:
     message = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+    log_path = Path(r"C:\Ozon") / "startup_error.log"
+    try:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        log_path.write_text(message, encoding="utf-8")
+    except OSError:
+        pass
     try:
         from PyQt6.QtWidgets import QApplication, QMessageBox
 
@@ -29,19 +35,11 @@ def _show_startup_error(exc: BaseException) -> None:
             "Ozon Parser — ошибка запуска",
             "Не удалось запустить приложение.\n\n"
             "Убедитесь, что установлен Google Chrome или Microsoft Edge.\n\n"
-            f"{exc}",
+            f"{exc}\n\n"
+            f"Подробности: {log_path}",
         )
-        # Keep a copy for support when the message box is closed.
-        log_path = Path(r"C:\Ozon") / "startup_error.log"
-        log_path.write_text(message, encoding="utf-8")
         app.quit()
     except Exception:
-        log_path = Path(r"C:\Ozon") / "startup_error.log"
-        try:
-            log_path.parent.mkdir(parents=True, exist_ok=True)
-            log_path.write_text(message, encoding="utf-8")
-        except OSError:
-            pass
         print(message, file=sys.stderr)
 
 

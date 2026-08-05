@@ -20,7 +20,22 @@ hiddenimports = [
     "lxml",
     "ozon_parser",
     "ozon_categories",
+    "PyQt6",
+    "PyQt6.QtCore",
+    "PyQt6.QtGui",
+    "PyQt6.QtWidgets",
+    "PyQt6.sip",
 ]
+
+# Fail fast if PyQt6 bindings are incomplete (Qt6 DLLs without QtCore.pyd).
+try:
+    import PyQt6.QtCore  # noqa: F401
+    import PyQt6.QtWidgets  # noqa: F401
+except ImportError as exc:
+    raise SystemExit(
+        "PyQt6 is broken or incomplete. Reinstall before building:\n"
+        "  py -3 -m pip install --user --force-reinstall PyQt6 PyQt6-Qt6 PyQt6-sip"
+    ) from exc
 
 for package in ("PyQt6", "playwright"):
     pkg_datas, pkg_binaries, pkg_hidden = collect_all(package)
