@@ -52,6 +52,8 @@ class ThemePreferenceTests(unittest.TestCase):
         self.assertIn(theme.DARK.window_bg, dark)
         self.assertIn(theme.LIGHT.window_bg, light)
         self.assertNotEqual(dark, light)
+        self.assertIn("ParamsScroll", dark)
+        self.assertIn("QScrollBar:vertical", dark)
 
 
 if __name__ == "__main__":

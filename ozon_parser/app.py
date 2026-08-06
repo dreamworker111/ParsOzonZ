@@ -6,11 +6,13 @@ from PyQt6.QtCore import Qt, QThread, QUrl, pyqtSignal
 from PyQt6.QtGui import QBrush, QColor, QDesktopServices, QFont, QFontDatabase
 from PyQt6.QtWidgets import (
     QApplication,
+    QBoxLayout,
     QCheckBox,
     QComboBox,
     QDialog,
     QDialogButtonBox,
     QDoubleSpinBox,
+    QFrame,
     QGroupBox,
     QHBoxLayout,
     QInputDialog,
@@ -21,6 +23,7 @@ from PyQt6.QtWidgets import (
     QPlainTextEdit,
     QProgressBar,
     QPushButton,
+    QScrollArea,
     QSizePolicy,
     QSpinBox,
     QTreeWidget,
@@ -1136,11 +1139,21 @@ class MainWindow(QMainWindow):
         self._theme: ThemeName = load_theme_preference()
 
         self.setWindowTitle("Ozon Parser — Баллы за отзыв")
+        # Keep min width below the narrow-layout breakpoint so stacked mode is reachable.
+        self.setMinimumSize(
+            max(640, min(760, int(screen.width() * 0.42))),
+            max(480, min(560, int(screen.height() * 0.48))),
+        )
+        self.resize(
+            max(980, min(screen.width() - 40, int(screen.width() * 0.92))),
+            max(680, min(screen.height() - 60, int(screen.height() * 0.9))),
+        )
 
         central = QWidget()
         self.setCentralWidget(central)
         root = QVBoxLayout(central)
-        pad = max(14, min(28, int(min(screen.width(), screen.height()) * 0.018)))
+        pad = max(10, min(24, int(min(screen.width(), screen.height()) * 0.016)))
+        self._layout_pad = pad
         root.setContentsMargins(pad, pad, pad, pad)
         root.setSpacing(pad)
 
@@ -1154,7 +1167,7 @@ class MainWindow(QMainWindow):
         self.help_btn = QPushButton("Инструкция")
         self.help_btn.setObjectName("SecondaryButton")
         self.help_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.help_btn.setMinimumWidth(130)
+        self.help_btn.setMinimumWidth(110)
         self.help_btn.setToolTip("Как пользоваться программой")
         setup_action_button(self.help_btn, min_height=40)
         self.help_btn.clicked.connect(self._show_instructions)
@@ -1163,7 +1176,7 @@ class MainWindow(QMainWindow):
         self.theme_btn = QPushButton()
         self.theme_btn.setObjectName("SecondaryButton")
         self.theme_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.theme_btn.setMinimumWidth(140)
+        self.theme_btn.setMinimumWidth(120)
         setup_action_button(self.theme_btn, min_height=40)
         self.theme_btn.clicked.connect(self._toggle_theme)
         self._refresh_theme_button()
@@ -1175,20 +1188,28 @@ class MainWindow(QMainWindow):
         header.addWidget(self.app_status_label)
         root.addLayout(header)
 
-        # --- Основная область: три колонки на всю ширину ---
-        main_row = QHBoxLayout()
-        main_row.setSpacing(pad)
+        # --- Основная область: адаптивные колонки ---
+        self._main_box = QBoxLayout(QBoxLayout.Direction.LeftToRight)
+        self._main_box.setSpacing(pad)
+        self._responsive_mode = "wide"
 
         col_policy = QSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
 
-        # Левая колонка — параметры парсинга
-        params_group = QGroupBox("Параметры парсинга")
-        params_group.setObjectName("ParamsGroup")
-        params_group.setSizePolicy(col_policy)
-        params_group.setMinimumWidth(320)
-        params_layout = QVBoxLayout(params_group)
-        params_layout.setContentsMargins(4, 8, 12, 8)
-        params_layout.setSpacing(14)
+        # Левая колонка — параметры парсинга (форма со скроллом + кнопки снизу)
+        self.params_group = QGroupBox("Параметры парсинга")
+        self.params_group.setObjectName("ParamsGroup")
+        self.params_group.setSizePolicy(col_policy)
+        self.params_group.setMinimumWidth(260)
+        params_outer = QVBoxLayout(self.params_group)
+        params_outer.setContentsMargins(4, 10, 6, 8)
+        params_outer.setSpacing(8)
+
+        params_form = QWidget()
+        params_form.setObjectName("ParamsForm")
+        params_form.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum)
+        params_layout = QVBoxLayout(params_form)
+        params_layout.setContentsMargins(4, 4, 10, 4)
+        params_layout.setSpacing(12)
         params_layout.setSizeConstraint(QVBoxLayout.SizeConstraint.SetMinimumSize)
 
         self.parse_mode_combo = QComboBox()
@@ -1226,20 +1247,20 @@ class MainWindow(QMainWindow):
         )
         params_layout.addWidget(param_field_block(self.seller_label, self.seller_input))
 
-        mode_row = QHBoxLayout()
-        mode_row.setSpacing(12)
+        self._mode_row = QBoxLayout(QBoxLayout.Direction.LeftToRight)
+        self._mode_row.setSpacing(12)
         self.browser_mode_combo = QComboBox()
         self.browser_mode_combo.addItem("Desktop", DESKTOP_MODE)
         self.browser_mode_combo.addItem("Мобильный", MOBILE_MODE)
         self.auth_mode_combo = QComboBox()
         self.auth_mode_combo.addItem("Без авторизации", False)
         self.auth_mode_combo.addItem("С авторизацией", True)
-        mode_row.addWidget(param_field_block("Режим браузера", self.browser_mode_combo))
-        mode_row.addWidget(param_field_block("Авторизация", self.auth_mode_combo))
-        params_layout.addLayout(mode_row)
+        self._mode_row.addWidget(param_field_block("Режим браузера", self.browser_mode_combo))
+        self._mode_row.addWidget(param_field_block("Авторизация", self.auth_mode_combo))
+        params_layout.addLayout(self._mode_row)
 
-        price_row = QHBoxLayout()
-        price_row.setSpacing(12)
+        self._price_row = QBoxLayout(QBoxLayout.Direction.LeftToRight)
+        self._price_row.setSpacing(12)
         self.min_price = QDoubleSpinBox()
         self.min_price.setRange(0, 9999999)
         self.min_price.setSuffix(" ₽")
@@ -1247,9 +1268,9 @@ class MainWindow(QMainWindow):
         self.max_price.setRange(0, 9999999)
         self.max_price.setValue(999999)
         self.max_price.setSuffix(" ₽")
-        price_row.addWidget(param_field_block("Цена от", self.min_price))
-        price_row.addWidget(param_field_block("Цена до", self.max_price))
-        params_layout.addLayout(price_row)
+        self._price_row.addWidget(param_field_block("Цена от", self.min_price))
+        self._price_row.addWidget(param_field_block("Цена до", self.max_price))
+        params_layout.addLayout(self._price_row)
 
         self.product_filter_combo = QComboBox()
         self.product_filter_combo.addItem("Только с баллами за отзыв", True)
@@ -1290,72 +1311,91 @@ class MainWindow(QMainWindow):
 
         self.detail_status_label = WrapLabel("Загрузите категории, чтобы начать")
         self.detail_status_label.setObjectName("DetailStatus")
-        self.detail_status_label.setMaximumHeight(48)
         self.detail_status_label.setSizePolicy(
             QSizePolicy.Policy.Expanding,
-            QSizePolicy.Policy.Maximum,
+            QSizePolicy.Policy.Minimum,
         )
         params_layout.addWidget(self.detail_status_label)
 
-        params_layout.addStretch(1)
+        self.params_scroll = QScrollArea()
+        self.params_scroll.setObjectName("ParamsScroll")
+        self.params_scroll.setWidgetResizable(True)
+        self.params_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.params_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.params_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.params_scroll.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Expanding,
+        )
+        self.params_scroll.setWidget(params_form)
+        params_outer.addWidget(self.params_scroll, stretch=1)
+
+        params_actions = QWidget()
+        params_actions.setObjectName("ParamsActions")
+        params_actions_layout = QVBoxLayout(params_actions)
+        params_actions_layout.setContentsMargins(4, 4, 10, 2)
+        params_actions_layout.setSpacing(8)
 
         self.start_btn = QPushButton("Запустить парсер")
         self.start_btn.setObjectName("PrimaryButton")
-        setup_action_button(self.start_btn, min_height=52)
+        setup_action_button(self.start_btn, min_height=48)
         self.start_btn.clicked.connect(self.toggle_parsing)
-        params_layout.addWidget(self.start_btn)
+        params_actions_layout.addWidget(self.start_btn)
 
         self.download_btn = QPushButton("Скачать XLSX (0)")
         self.download_btn.setObjectName("SecondaryButton")
         self.download_btn.setEnabled(False)
-        setup_action_button(self.download_btn, min_height=52)
+        setup_action_button(self.download_btn, min_height=48)
         self.download_btn.clicked.connect(self.download_xlsx)
-        params_layout.addWidget(self.download_btn)
+        params_actions_layout.addWidget(self.download_btn)
+        params_outer.addWidget(params_actions)
 
-        main_row.addWidget(params_group, stretch=22)
+        self._main_box.addWidget(self.params_group, stretch=22)
 
         # Центральный блок — каталог
-        catalog_wrap = QWidget()
-        catalog_wrap.setSizePolicy(col_policy)
-        catalog_layout = QVBoxLayout(catalog_wrap)
+        self.catalog_wrap = QWidget()
+        self.catalog_wrap.setSizePolicy(col_policy)
+        catalog_layout = QVBoxLayout(self.catalog_wrap)
         catalog_layout.setContentsMargins(0, 0, 0, 0)
         catalog_layout.setSpacing(pad)
 
-        catalog_group = QGroupBox("Категории магазина")
-        catalog_group.setObjectName("CatalogGroup")
-        catalog_group.setSizePolicy(col_policy)
-        cat_inner = QVBoxLayout(catalog_group)
+        self.catalog_group = QGroupBox("Категории Ozon")
+        self.catalog_group.setObjectName("CatalogGroup")
+        self.catalog_group.setSizePolicy(col_policy)
+        cat_inner = QVBoxLayout(self.catalog_group)
         cat_inner.setSpacing(pad)
 
-        cat_header = QHBoxLayout()
         cat_hint = QLabel(
             "Дерево категорий: сверху главные разделы, внутри — вложенные. "
             "Наведите на пункт, чтобы увидеть полный путь. Отметьте нужные и запустите парсер."
         )
         cat_hint.setObjectName("CatalogHint")
         cat_hint.setWordWrap(True)
-        cat_header.addWidget(cat_hint, stretch=1)
+        cat_inner.addWidget(cat_hint)
+
+        self._cat_actions_row = QBoxLayout(QBoxLayout.Direction.LeftToRight)
+        self._cat_actions_row.setSpacing(8)
 
         self.select_all_cat_btn = QPushButton("Выбрать все")
         self.select_all_cat_btn.setObjectName("LinkButton")
         self.select_all_cat_btn.setFlat(True)
         self.select_all_cat_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.select_all_cat_btn.clicked.connect(self._select_all_categories)
-        cat_header.addWidget(self.select_all_cat_btn)
+        self._cat_actions_row.addWidget(self.select_all_cat_btn)
 
         self.reset_cat_btn = QPushButton("Сбросить")
         self.reset_cat_btn.setObjectName("LinkButton")
         self.reset_cat_btn.setFlat(True)
         self.reset_cat_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.reset_cat_btn.clicked.connect(self._reset_categories)
-        cat_header.addWidget(self.reset_cat_btn)
+        self._cat_actions_row.addWidget(self.reset_cat_btn)
 
         self.selected_cat_count_label = QLabel("Выбрано: 0")
         self.selected_cat_count_label.setObjectName("SelectedCategoryCount")
         self.selected_cat_count_label.setToolTip(
             "Сколько категорий отмечено сейчас — столько уйдёт в парсер"
         )
-        cat_header.addWidget(self.selected_cat_count_label)
+        self._cat_actions_row.addWidget(self.selected_cat_count_label)
 
         self.rename_cat_btn = QPushButton("✎")
         self.rename_cat_btn.setObjectName("LinkButton")
@@ -1365,13 +1405,14 @@ class MainWindow(QMainWindow):
         self.rename_cat_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.rename_cat_btn.setEnabled(False)
         self.rename_cat_btn.clicked.connect(self._rename_selected_category)
-        cat_header.addWidget(self.rename_cat_btn)
-        cat_inner.addLayout(cat_header)
+        self._cat_actions_row.addWidget(self.rename_cat_btn)
+        self._cat_actions_row.addStretch(1)
+        cat_inner.addLayout(self._cat_actions_row)
 
         self.category_tree = FilterTreeWidget()
         self.category_tree.setObjectName("CategoryTree")
         self.category_tree.setSizePolicy(col_policy)
-        self.category_tree.setMinimumHeight(200)
+        self.category_tree.setMinimumHeight(160)
         self.category_tree.currentItemChanged.connect(
             self._update_rename_category_button
         )
@@ -1396,16 +1437,16 @@ class MainWindow(QMainWindow):
         setup_action_button(self.load_subcat_btn, min_height=44)
         cat_inner.addWidget(self.load_subcat_btn)
 
-        catalog_layout.addWidget(catalog_group, stretch=1)
+        catalog_layout.addWidget(self.catalog_group, stretch=1)
 
-        main_row.addWidget(catalog_wrap, stretch=46)
+        self._main_box.addWidget(self.catalog_wrap, stretch=46)
 
         # Правая колонка — прогресс и лог
-        progress_group = QGroupBox("Прогресс и лог")
-        progress_group.setObjectName("ProgressGroup")
-        progress_group.setSizePolicy(col_policy)
-        progress_group.setMinimumWidth(240)
-        progress_layout = QVBoxLayout(progress_group)
+        self.progress_group = QGroupBox("Прогресс и лог")
+        self.progress_group.setObjectName("ProgressGroup")
+        self.progress_group.setSizePolicy(col_policy)
+        self.progress_group.setMinimumWidth(200)
+        progress_layout = QVBoxLayout(self.progress_group)
         progress_layout.setSpacing(pad)
 
         self.progress_value_label = QLabel("—")
@@ -1425,15 +1466,16 @@ class MainWindow(QMainWindow):
         self.log_view.setObjectName("LogView")
         self.log_view.setPlaceholderText("Здесь будут сообщения о ходе работы...")
         self.log_view.setSizePolicy(col_policy)
-        self.log_view.setMinimumHeight(100)
+        self.log_view.setMinimumHeight(80)
         progress_layout.addWidget(self.log_view, stretch=1)
 
-        main_row.addWidget(progress_group, stretch=32)
+        self._main_box.addWidget(self.progress_group, stretch=32)
 
-        root.addLayout(main_row, stretch=1)
+        root.addLayout(self._main_box, stretch=1)
 
         footer = QLabel(f"Файлы сохраняются в: {OUTPUT_DIR}")
         footer.setObjectName("Footer")
+        footer.setWordWrap(True)
         footer.setAlignment(Qt.AlignmentFlag.AlignCenter)
         root.addWidget(footer)
 
@@ -1442,6 +1484,96 @@ class MainWindow(QMainWindow):
         self._set_app_status(self.STATUS_IDLE, parsing=False)
         self._update_download_button()
         self._on_parse_mode_changed()
+        self._update_responsive_layout(force=True)
+
+    def resizeEvent(self, event) -> None:  # noqa: N802
+        super().resizeEvent(event)
+        self._update_responsive_layout()
+
+    def _update_responsive_layout(self, *, force: bool = False) -> None:
+        """Switch between side-by-side and stacked columns when the window is narrow."""
+        if not hasattr(self, "_main_box"):
+            return
+        width = self.width()
+        if width <= 0:
+            return
+
+        if width < 900:
+            mode = "narrow"
+        elif width < 1180:
+            mode = "medium"
+        else:
+            mode = "wide"
+
+        if not force and mode == getattr(self, "_responsive_mode", None):
+            if mode == "narrow":
+                params_h = max(360, min(560, int(self.height() * 0.55)))
+                if self.params_group.height() != params_h:
+                    self.params_group.setFixedHeight(params_h)
+            self._update_nested_field_rows()
+            return
+
+        self._responsive_mode = mode
+        if mode == "narrow":
+            self._main_box.setDirection(QBoxLayout.Direction.TopToBottom)
+            self._main_box.setStretch(0, 0)
+            self._main_box.setStretch(1, 3)
+            self._main_box.setStretch(2, 2)
+            # Fixed height so pinned buttons leave a usable scroll viewport.
+            params_h = max(360, min(560, int(self.height() * 0.55)))
+            self.params_group.setMinimumWidth(0)
+            self.params_group.setFixedHeight(params_h)
+            self.progress_group.setMinimumWidth(0)
+            self.category_tree.setMinimumHeight(120)
+            self.log_view.setMinimumHeight(90)
+            setup_action_button(self.start_btn, min_height=40)
+            setup_action_button(self.download_btn, min_height=40)
+        elif mode == "medium":
+            self._main_box.setDirection(QBoxLayout.Direction.LeftToRight)
+            self._main_box.setStretch(0, 28)
+            self._main_box.setStretch(1, 42)
+            self._main_box.setStretch(2, 30)
+            self.params_group.setMinimumHeight(0)
+            self.params_group.setMaximumHeight(16777215)
+            self.params_group.setMinimumWidth(240)
+            self.progress_group.setMinimumWidth(180)
+            self.category_tree.setMinimumHeight(160)
+            self.log_view.setMinimumHeight(80)
+            setup_action_button(self.start_btn, min_height=48)
+            setup_action_button(self.download_btn, min_height=48)
+        else:
+            self._main_box.setDirection(QBoxLayout.Direction.LeftToRight)
+            self._main_box.setStretch(0, 22)
+            self._main_box.setStretch(1, 46)
+            self._main_box.setStretch(2, 32)
+            self.params_group.setMinimumHeight(0)
+            self.params_group.setMaximumHeight(16777215)
+            self.params_group.setMinimumWidth(260)
+            self.progress_group.setMinimumWidth(200)
+            self.category_tree.setMinimumHeight(160)
+            self.log_view.setMinimumHeight(80)
+            setup_action_button(self.start_btn, min_height=48)
+            setup_action_button(self.download_btn, min_height=48)
+
+        self._update_nested_field_rows()
+
+    def _update_nested_field_rows(self) -> None:
+        """Stack browser/auth and price rows when the params column is narrow."""
+        if not hasattr(self, "_mode_row") or not hasattr(self, "params_group"):
+            return
+        col_w = self.params_group.width()
+        if col_w <= 0:
+            col_w = self.width()
+        stack = col_w > 0 and col_w < 360
+        direction = (
+            QBoxLayout.Direction.TopToBottom
+            if stack
+            else QBoxLayout.Direction.LeftToRight
+        )
+        if self._mode_row.direction() != direction:
+            self._mode_row.setDirection(direction)
+        if self._price_row.direction() != direction:
+            self._price_row.setDirection(direction)
 
     def _set_app_status(self, text: str, *, parsing: bool = False) -> None:
         self.app_status_label.setText(text)
@@ -1487,24 +1619,80 @@ class MainWindow(QMainWindow):
             if needs_seller
             else "Не требуется — общий каталог Ozon"
         )
+        self._update_catalog_title()
         self._on_session_mode_changed()
+
+    def _update_catalog_title(self) -> None:
+        if not hasattr(self, "catalog_group"):
+            return
+        if self._parse_mode_requires_seller_url():
+            self.catalog_group.setTitle("Категории магазина")
+        else:
+            self.catalog_group.setTitle("Категории Ozon")
 
     def _update_session_controls(self) -> None:
         mobile = self._selected_browser_mode() == MOBILE_MODE
         use_auth = self._selected_use_auth()
         self.chrome_mode_label.setVisible(not mobile)
         self.mobile_login_btn.setVisible(mobile and use_auth)
+        parsing = bool(self.parse_worker and self.parse_worker.isRunning())
         self.mobile_login_btn.setEnabled(
             mobile
             and use_auth
+            and not parsing
             and not (
                 self.mobile_login_worker
                 and self.mobile_login_worker.isRunning()
             )
         )
 
+    def _set_parse_settings_enabled(self, enabled: bool) -> None:
+        """Lock/unlock settings that would invalidate an active run."""
+        self.parse_mode_combo.setEnabled(enabled)
+        self.browser_mode_combo.setEnabled(enabled)
+        self.auth_mode_combo.setEnabled(enabled)
+        if enabled:
+            self.seller_label.setEnabled(self._parse_mode_requires_seller_url())
+            self.seller_input.setEnabled(self._parse_mode_requires_seller_url())
+        else:
+            self.seller_label.setEnabled(False)
+            self.seller_input.setEnabled(False)
+        self.min_price.setEnabled(enabled)
+        self.max_price.setEnabled(enabled)
+        self.product_filter_combo.setEnabled(enabled)
+        self.max_products.setEnabled(enabled)
+        self._update_session_controls()
+
+    def _set_catalog_load_enabled(
+        self,
+        *,
+        load_cat: bool,
+        load_subcat: bool,
+        allow_rename: bool | None = None,
+    ) -> None:
+        self.load_cat_btn.setEnabled(load_cat)
+        self.load_subcat_btn.setEnabled(load_subcat)
+        if allow_rename is None:
+            allow_rename = load_cat
+        if allow_rename:
+            self._update_rename_category_button(self.category_tree.currentItem())
+        else:
+            self.rename_cat_btn.setEnabled(False)
+
+    def _restore_idle_controls(self) -> None:
+        """Re-enable settings after parse/load finishes or fails."""
+        self._set_parse_settings_enabled(True)
+        self._set_catalog_load_enabled(
+            load_cat=True,
+            load_subcat=self._roots_loaded,
+        )
+        self.start_btn.setEnabled(True)
+        self._update_session_controls()
+
     def _on_session_mode_changed(self) -> None:
         self._update_session_controls()
+        if self.parse_worker and self.parse_worker.isRunning():
+            return
         if (
             self._loaded_category_mode is not None
             and (
@@ -1556,9 +1744,26 @@ class MainWindow(QMainWindow):
             QDesktopServices.openUrl(QUrl.fromLocalFile(path))
             return
         if self._last_export_meta:
-            path = str(export_products(self._parsed_products, self._last_export_meta).resolve())
+            try:
+                path = str(
+                    export_products(self._parsed_products, self._last_export_meta).resolve()
+                )
+            except Exception as exc:
+                QMessageBox.warning(
+                    self,
+                    "Не удалось сохранить XLSX",
+                    f"Файл результата недоступен, повторная выгрузка не удалась:\n{exc}",
+                )
+                return
             self._parsed_filepath = path
             QDesktopServices.openUrl(QUrl.fromLocalFile(path))
+            return
+        QMessageBox.warning(
+            self,
+            "Файл недоступен",
+            "Результаты есть в памяти, но файл XLSX не найден и метаданные "
+            "экспорта отсутствуют. Запустите парсер ещё раз.",
+        )
 
     def _apply_styles(self) -> None:
         fs = self.app_font.pointSize()
@@ -1664,8 +1869,8 @@ class MainWindow(QMainWindow):
 
     def _on_worker_progress(self, message: str) -> None:
         self._append_log(message)
-        # Keep the params-panel status short so «Скачать XLSX» stays visible.
-        short = message if len(message) <= 90 else message[:87] + "..."
+        # Keep the params-panel status readable; full text is in the log.
+        short = message if len(message) <= 160 else message[:157] + "..."
         self.status_label.setText(short)
 
     def _reset_parse_display(self) -> None:
@@ -1820,6 +2025,13 @@ class MainWindow(QMainWindow):
         return str(target.param_value or target.category_id or target.id)
 
     def load_categories(self) -> None:
+        if self.parse_worker and self.parse_worker.isRunning():
+            QMessageBox.information(
+                self,
+                "Парсинг выполняется",
+                "Дождитесь окончания парсинга или остановите его.",
+            )
+            return
         scope = self._category_tree_scope()
         needs_seller = self._parse_mode_requires_seller_url()
         url = self.seller_input.text().strip() if needs_seller else ""
@@ -1843,11 +2055,9 @@ class MainWindow(QMainWindow):
         use_auth = self._selected_use_auth()
         self._catalog_subcat_total = 0
         self._roots_loaded = False
-        self.load_cat_btn.setEnabled(False)
-        self.load_subcat_btn.setEnabled(False)
+        self._set_parse_settings_enabled(False)
+        self._set_catalog_load_enabled(load_cat=False, load_subcat=False, allow_rename=False)
         self.start_btn.setEnabled(False)
-        self.parse_mode_combo.setEnabled(False)
-        self.rename_cat_btn.setEnabled(False)
         self._subcat_queue.clear()
         self._subcat_loaded_ids.clear()
         self._subcat_in_progress_ids.clear()
@@ -1877,6 +2087,13 @@ class MainWindow(QMainWindow):
         self.category_worker.start()
 
     def load_selected_subcategories(self) -> None:
+        if self.parse_worker and self.parse_worker.isRunning():
+            QMessageBox.information(
+                self,
+                "Парсинг выполняется",
+                "Дождитесь окончания парсинга или остановите его.",
+            )
+            return
         roots = self.category_tree.selected_root_categories()
         if not roots:
             QMessageBox.warning(
@@ -1921,10 +2138,8 @@ class MainWindow(QMainWindow):
             return
         browser_mode = self._selected_browser_mode()
         use_auth = self._selected_use_auth()
-        self.load_cat_btn.setEnabled(False)
-        self.load_subcat_btn.setEnabled(False)
-        self.parse_mode_combo.setEnabled(False)
-        self.rename_cat_btn.setEnabled(False)
+        self._set_parse_settings_enabled(False)
+        self._set_catalog_load_enabled(load_cat=False, load_subcat=False, allow_rename=False)
         for target in roots:
             self._subcat_in_progress_ids.add(self._root_target_id(target))
         names = ", ".join((t.name or t.id) for t in roots[:5])
@@ -1969,11 +2184,7 @@ class MainWindow(QMainWindow):
         if not self.category_tree.topLevelItemCount() and categories:
             self.category_tree.set_initial_roots(categories, pending_subcategories=True)
         self._roots_loaded = True
-        self.load_cat_btn.setEnabled(True)
-        self.load_subcat_btn.setEnabled(True)
-        self.start_btn.setEnabled(True)
-        self.parse_mode_combo.setEnabled(True)
-        self._update_rename_category_button(self.category_tree.currentItem())
+        self._restore_idle_controls()
         self.status_label.setText(
             f"Главных категорий: {len(categories)}. "
             "Отметьте разделы → «Загрузить подкатегории»."
@@ -2008,11 +2219,7 @@ class MainWindow(QMainWindow):
             if root_id:
                 self._subcat_loaded_ids.add(root_id)
                 self._subcat_in_progress_ids.discard(root_id)
-        self.load_cat_btn.setEnabled(True)
-        self.load_subcat_btn.setEnabled(True)
-        self.start_btn.setEnabled(True)
-        self.parse_mode_combo.setEnabled(True)
-        self._update_rename_category_button(self.category_tree.currentItem())
+        self._restore_idle_controls()
         sub_count = self._count_subcategories(branches)
         self.status_label.setText(
             f"Подкатегории загружены для {len(branches)} раздел(ов), "
@@ -2028,11 +2235,7 @@ class MainWindow(QMainWindow):
 
     def _on_subcategories_failed(self, error: str) -> None:
         self._subcat_in_progress_ids.clear()
-        self.load_cat_btn.setEnabled(True)
-        self.load_subcat_btn.setEnabled(self._roots_loaded)
-        self.start_btn.setEnabled(True)
-        self.parse_mode_combo.setEnabled(True)
-        self._update_rename_category_button(self.category_tree.currentItem())
+        self._restore_idle_controls()
         self.status_label.setText(f"Ошибка загрузки подкатегорий: {error}")
         hint = (
             "Ozon заблокировал доступ (это не ошибка интернета).\n\n"
@@ -2045,16 +2248,12 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Ошибка", error)
 
     def _on_categories_failed(self, error: str) -> None:
-        self.load_cat_btn.setEnabled(True)
-        self.load_subcat_btn.setEnabled(False)
-        self.start_btn.setEnabled(True)
-        self.parse_mode_combo.setEnabled(True)
-        self._update_rename_category_button(self.category_tree.currentItem())
         self._loaded_category_mode = None
         self._loaded_category_auth = None
         self._loaded_category_scope = None
         self._loaded_parse_mode = None
         self._roots_loaded = False
+        self._restore_idle_controls()
         self.status_label.setText(f"Ошибка загрузки категорий: {error}")
         hint = (
             "Ozon заблокировал доступ (это не ошибка интернета).\n\n"
@@ -2181,6 +2380,18 @@ class MainWindow(QMainWindow):
             if answer != QMessageBox.StandardButton.Yes:
                 return
 
+        if (
+            self.min_price.value() > 0
+            and self.max_price.value() > 0
+            and self.min_price.value() > self.max_price.value()
+        ):
+            QMessageBox.warning(
+                self,
+                "Неверный диапазон цен",
+                "Значение «Цена от» не может быть больше «Цена до».",
+            )
+            return
+
         min_p = self.min_price.value() if self.min_price.value() > 0 else None
         max_p = self.max_price.value() if self.max_price.value() < 999999 else None
 
@@ -2263,7 +2474,8 @@ class MainWindow(QMainWindow):
         self.start_btn.setText("Остановить парсер")
         self.start_btn.setEnabled(True)
         self.download_btn.setVisible(True)
-        self.load_cat_btn.setEnabled(False)
+        self._set_parse_settings_enabled(False)
+        self._set_catalog_load_enabled(load_cat=False, load_subcat=False, allow_rename=False)
 
     def _selected_targets_label(self, categories: list[CategoryTarget]) -> str:
         if not categories:
@@ -2290,8 +2502,7 @@ class MainWindow(QMainWindow):
     def _on_parse_finished(self, products: list, filepath: str, stats) -> None:
         self._set_app_status(self.STATUS_IDLE, parsing=False)
         self.start_btn.setText("Запустить парсер")
-        self.start_btn.setEnabled(True)
-        self.load_cat_btn.setEnabled(True)
+        self._restore_idle_controls()
         duration_text = stats.total_duration_fmt if stats else "—"
         self._parsed_products = products
         self._parsed_filepath = filepath
@@ -2337,8 +2548,7 @@ class MainWindow(QMainWindow):
     def _on_parse_failed(self, error: str) -> None:
         self._set_app_status(self.STATUS_IDLE, parsing=False)
         self.start_btn.setText("Запустить парсер")
-        self.start_btn.setEnabled(True)
-        self.load_cat_btn.setEnabled(True)
+        self._restore_idle_controls()
         self.status_label.setText(f"Ошибка: {error}")
         self._append_log(f"Ошибка: {error}")
         QMessageBox.critical(self, "Ошибка", error)

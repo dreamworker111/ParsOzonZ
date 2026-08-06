@@ -453,18 +453,43 @@ def build_stylesheet(
                 font-weight: 300;
                 color: {c.checkbox_fg};
             }}
+            QScrollArea#ParamsScroll {{
+                background: transparent;
+                border: none;
+            }}
+            QScrollArea#ParamsScroll > QWidget > QWidget {{
+                background: transparent;
+            }}
+            QWidget#ParamsForm {{
+                background: transparent;
+            }}
+            QWidget#ParamsActions {{
+                background: transparent;
+            }}
             QScrollBar:vertical {{
                 background: {c.scrollbar_bg};
                 width: 10px;
+                margin: 2px 0 2px 0;
                 border-radius: 5px;
             }}
             QScrollBar::handle:vertical {{
                 background: {c.scrollbar_handle};
                 border-radius: 5px;
-                min-height: 24px;
+                min-height: 28px;
+            }}
+            QScrollBar::handle:vertical:hover {{
+                background: {c.accent_soft};
             }}
             QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{
                 height: 0;
+                background: none;
+            }}
+            QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {{
+                background: none;
+            }}
+            QScrollArea#ParamsScroll QScrollBar:vertical {{
+                width: 11px;
+                background: {c.scrollbar_bg};
             }}
             QLabel#ProgressValue {{
                 font-size: {fs + 8}px;
