@@ -927,6 +927,7 @@ class CategoryLoader:
                             visited=seen,
                             page_visits=visits,
                         )
+            # Final UI sync once per root (avoid duplicate rebuild of deep leaves).
             _emit_branch()
 
 
@@ -1167,6 +1168,7 @@ class CategoryLoader:
         visited: set[str] | None = None,
         page_visits: list[int] | None = None,
         page_max_depth: int | None = None,
+        ancestors: set[str] | None = None,
     ) -> None:
         """Page+view-all for shallow levels; Composer fills the rest (fast)."""
         if deadline is not None and self._past_deadline(deadline):
@@ -1213,36 +1215,56 @@ class CategoryLoader:
         deeper_ids = set(
             (getattr(self, "_composer_deeper_ids", {}) or {}).get(cid) or set()
         )
+        # For concrete shops, Composer "deeper ids" can be incomplete/noisy and may
+        # accidentally include real direct children on deep levels. Do not exclude
+        # by this hint in seller mode, otherwise recursion can stop around L3.
+        if self._is_seller_shop_base(seller_base):
+            deeper_ids = set()
+        elif not api_children:
+            deeper_ids = set()
+        else:
+            dom_children_preview = self._unwrap_parent_children(raw, cid)
+            nested_dom = any((n.get("children") or []) for n in dom_children_preview)
+            if nested_dom:
+                # DOM already exposes hierarchy — Composer "deeper" hints often lie.
+                deeper_ids = set()
+        ancestor_ids = set(ancestors or ())
+        ancestor_ids.add(cid)
+        # Never treat parent/ancestor sections as "children" of a deeper node.
+        # Ozon menus often re-list «Женские аксессуары» under «Аксессуары для волос».
+        exclude_ids = set(deeper_ids) | ancestor_ids
         children = self._resolve_direct_child_seeds(
             raw,
             parent_id=cid,
             api_children=api_children,
-            exclude_ids=deeper_ids,
+            exclude_ids=exclude_ids,
+            ancestor_ids=ancestor_ids,
         )
         if not children and api_children:
             children = self._resolve_direct_child_seeds(
                 api_children,
                 parent_id=cid,
                 api_children=api_children,
-                exclude_ids=deeper_ids,
+                exclude_ids=exclude_ids,
+                ancestor_ids=ancestor_ids,
             )
 
-        node["children"] = children
-        if not children:
+        node["children"] = self._dedupe_category_dict_children(children)
+        if not node["children"]:
             log(f"{indent}  листьев/подкатегорий нет")
-            if on_update:
+            if on_update and depth <= 1:
                 on_update()
             return
 
         log(
-            f"{indent}  прямых подкатегорий: {len(children)}"
+            f"{indent}  прямых подкатегорий: {len(node['children'])}"
             + (
                 f" (DOM/view-all + Composer {len(api_children)})"
                 if api_children
                 else " (DOM/view-all)"
             )
         )
-        if on_update:
+        if on_update and depth <= 1:
             on_update()
 
         # Last page level: fill deeper nodes via Composer (no more navigations).
@@ -1255,7 +1277,7 @@ class CategoryLoader:
                 )
                 # Keep walking pages for remaining depth instead of global API fill.
                 if depth < self.MAX_SUBCATEGORY_DEPTH:
-                    for index, child in enumerate(children, start=1):
+                    for index, child in enumerate(node["children"], start=1):
                         if deadline is not None and self._past_deadline(deadline):
                             break
                         if is_access_restricted(self.page) or is_blocked_page(self.page):
@@ -1276,8 +1298,9 @@ class CategoryLoader:
                             visited=seen,
                             page_visits=visits,
                             page_max_depth=self.MAX_SUBCATEGORY_DEPTH,
+                            ancestors=ancestor_ids,
                         )
-                if on_update:
+                if on_update and depth <= 1:
                     on_update()
                 return
             log(
@@ -1286,26 +1309,27 @@ class CategoryLoader:
             )
             self._complete_category_subtree(
                 seller_base,
-                children,
+                node["children"],
                 log,
                 deadline=deadline,
                 max_depth=max(1, self.MAX_SUBCATEGORY_DEPTH - depth),
+                on_manual_bypass=on_manual_bypass,
             )
-            for child in children:
+            for child in node["children"]:
                 cid_child = str(child.get("id") or "")
                 if cid_child:
                     seen.add(cid_child)
-            if on_update:
+            if on_update and depth <= 1:
                 on_update()
             if depth == 0:
                 total = self._count_dict_descendants(node)
                 log(
-                    f"  ветка «{name}»: {len(children)} верхнего уровня, "
+                    f"  ветка «{name}»: {len(node['children'])} верхнего уровня, "
                     f"всего узлов: {total}, страниц: {visits[0]}"
                 )
             return
 
-        for index, child in enumerate(children, start=1):
+        for index, child in enumerate(node["children"], start=1):
             if deadline is not None and self._past_deadline(deadline):
                 log(f"{indent}  лимит времени: глубина собрана частично")
                 break
@@ -1341,12 +1365,13 @@ class CategoryLoader:
                 visited=seen,
                 page_visits=visits,
                 page_max_depth=walk_limit,
+                ancestors=ancestor_ids,
             )
 
         if depth == 0:
             total = self._count_dict_descendants(node)
             log(
-                f"  ветка «{name}»: {len(children)} верхнего уровня, "
+                f"  ветка «{name}»: {len(node.get('children') or [])} верхнего уровня, "
                 f"всего узлов: {total}, страниц: {visits[0]}"
             )
 
@@ -1481,6 +1506,7 @@ class CategoryLoader:
         parent_id: str,
         api_children: list[dict] | None = None,
         exclude_ids: set[str] | None = None,
+        ancestor_ids: set[str] | None = None,
     ) -> list[dict]:
         """Build direct-child seeds for depth walk.
 
@@ -1488,9 +1514,14 @@ class CategoryLoader:
         often truncated to the pre-modal filter, so it must not drop DOM extras.
         Composer/DOM nesting only excludes known grandchildren.
         Sibling shop roots (Одежда / Красота / …) are never children of another root.
+        Ancestor ids (parent chain) are never accepted as children — Ozon often
+        re-lists «Женские аксессуары» under deeper hair-accessory pages.
         """
         parent_id = str(parent_id or "")
         root_ids = {str(x) for x in (getattr(self, "_seller_root_ids", set()) or set())}
+        ancestors = {str(x) for x in (ancestor_ids or set()) if str(x)}
+        if parent_id:
+            ancestors.add(parent_id)
         dom_children = self._unwrap_parent_children(nodes or [], parent_id)
         api_list = [
             item
@@ -1500,6 +1531,7 @@ class CategoryLoader:
         ]
         excluded = {str(x) for x in (exclude_ids or set()) if str(x)}
         excluded.update(cid for cid in root_ids if cid != parent_id)
+        excluded.update(ancestors)
 
         def flatten_index(items: list[dict]) -> dict[str, dict]:
             store: dict[str, dict] = {}
@@ -1524,7 +1556,7 @@ class CategoryLoader:
 
         def seed_from(source: dict, fallback_name: str = "") -> dict | None:
             cid = str(source.get("id") or "")
-            if not cid or cid == parent_id or cid in excluded:
+            if not cid or cid == parent_id or cid in excluded or cid in ancestors:
                 return None
             if cid in root_ids and cid != parent_id:
                 return None
@@ -1571,9 +1603,66 @@ class CategoryLoader:
 
         return seeds
 
+    def _dedupe_category_dict_children(self, children: list[dict]) -> list[dict]:
+        """Keep first occurrence of each category id (avoids L5 double-insert)."""
+        seen: set[str] = set()
+        result: list[dict] = []
+        for child in children or []:
+            cid = str(child.get("id") or "").strip()
+            if not cid or cid in seen:
+                continue
+            seen.add(cid)
+            result.append(child)
+        return result
+
     def _as_depth_seed_nodes(self, nodes: list[dict]) -> list[dict]:
         """Top-level IDs with empty children for Composer/page depth fill."""
         return self._resolve_direct_child_seeds(nodes, parent_id="", api_children=None)
+
+    def _try_page_child_fill(
+        self,
+        seller_base: str,
+        node: dict,
+        log,
+        on_manual_bypass,
+    ) -> bool:
+        """Open category page when Composer returned no children."""
+        if node.get("children"):
+            return False
+        cid = str(node.get("id") or "")
+        if not cid:
+            return False
+        if is_access_restricted(self.page) or is_blocked_page(self.page):
+            return False
+        parent = {
+            "id": cid,
+            "name": str(node.get("name") or cid),
+            "url": node.get("url") or self._build_category_url(seller_base, cid),
+            "children": [],
+        }
+        raw = self._fetch_category_subtree(seller_base, parent, log, on_manual_bypass)
+        if not raw:
+            return False
+        api_children = list(self._last_fetch_api_children or [])
+        seeds = self._resolve_direct_child_seeds(
+            raw,
+            parent_id=cid,
+            api_children=api_children,
+        )
+        if not seeds and api_children:
+            seeds = self._resolve_direct_child_seeds(
+                api_children,
+                parent_id=cid,
+                api_children=api_children,
+            )
+        if not seeds:
+            return False
+        node["children"] = seeds
+        log(
+            f"  страница «Посмотреть все»: +{len(seeds)} подкатегорий "
+            f"для «{node.get('name', cid)}»"
+        )
+        return True
 
     def _complete_category_subtree(
         self,
@@ -1582,6 +1671,7 @@ class CategoryLoader:
         log,
         deadline: float | None = None,
         max_depth: int | None = None,
+        on_manual_bypass=None,
     ) -> None:
         """Дозагрузить полную иерархию через Composer API (без переходов по страницам).
 
@@ -1627,19 +1717,34 @@ class CategoryLoader:
                 for node, depth in batch:
                     cid = str(node["id"])
                     node["_composer_done"] = True
-                    api_children = results.get(cid) or []
+                    api_children = [
+                        child
+                        for child in (results.get(cid) or [])
+                        if str(child.get("id") or "") not in {"", cid}
+                    ]
                     existing = node.get("children") or []
                     if not existing:
                         if api_children:
-                            node["children"] = api_children
+                            node["children"] = self._dedupe_category_dict_children(api_children)
                             fetched += 1
                             enriched = True
                     elif api_children:
                         merged = self._merge_category_dict_lists(existing, api_children)
+                        merged = [
+                            child
+                            for child in merged
+                            if str(child.get("id") or "") not in {"", cid}
+                        ]
                         if self._count_dict_descendants(
                             {"children": merged}
                         ) > self._count_dict_descendants({"children": existing}):
-                            node["children"] = merged
+                            node["children"] = self._dedupe_category_dict_children(merged)
+                            fetched += 1
+                            enriched = True
+                    elif not existing and not api_children:
+                        if self._try_page_child_fill(
+                            seller_base, node, log, on_manual_bypass,
+                        ):
                             fetched += 1
                             enriched = True
                     for child in node.get("children") or []:
@@ -2977,10 +3082,22 @@ class CategoryLoader:
             )
         else:
             parts.append(detail or "Общий каталог не вернул корневые категории.")
-            parts.append(
-                "Chrome откроется при «Загрузить категории». "
-                "Убедитесь, что сайт загружается без блокировки, затем повторите."
-            )
+            try:
+                from .browser import probe_chrome_network, OZON_NETWORK_BLOCK_HINT
+
+                internet_ok, ozon_ok = probe_chrome_network(self.page)
+                if internet_ok and not ozon_ok:
+                    parts.append(OZON_NETWORK_BLOCK_HINT)
+                else:
+                    parts.append(
+                        "Chrome откроется при «Загрузить категории». "
+                        "Убедитесь, что сайт загружается без блокировки, затем повторите."
+                    )
+            except Exception:
+                parts.append(
+                    "Chrome откроется при «Загрузить категории». "
+                    "Убедитесь, что сайт загружается без блокировки, затем повторите."
+                )
         return ConnectionError("\n".join(parts))
 
     def _load_global_root_categories(self, log, on_manual_bypass) -> list[dict]:

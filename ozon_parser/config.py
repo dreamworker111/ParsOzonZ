@@ -148,7 +148,7 @@ BLOCK_POST_CLEAR_COOLDOWN_MAX = 25.0
 
 MAX_CATEGORY_RETRIES = 1
 # Never auto-retry page.goto while an incident/fab_ page is active.
-SAFE_GOTO_MAX_RETRIES = 1
+SAFE_GOTO_MAX_RETRIES = 3
 # Detail-page opens are the main ban trigger. Bulk mode uses listing cards only.
 MAX_PRODUCT_DETAIL_FETCHES = 0
 CATALOG_LOAD_TIMEOUT_SEC = 900
@@ -156,7 +156,7 @@ CATALOG_LOAD_TIMEOUT_SEC = 900
 # - page + «Посмотреть все» only up to GLOBAL_CATEGORY_PAGE_MAX_DEPTH
 # - deeper levels filled via Composer API (no navigation) — much faster
 # Parallel Composer still tends to trigger fab_; stay sequential with short jitter.
-GLOBAL_CATEGORY_PAGE_MAX_DEPTH = 1  # 0=root page, 1=each L1 page, then API depth
+GLOBAL_CATEGORY_PAGE_MAX_DEPTH = 5  # page + «Посмотреть все» per level, then Composer
 # Specific seller: walk every level with page + «Посмотреть все» (full depth).
 SELLER_CATEGORY_PAGE_MAX_DEPTH = 15
 GLOBAL_COMPOSER_BATCH_SIZE = 5

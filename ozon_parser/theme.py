@@ -196,6 +196,7 @@ def build_stylesheet(
     btn_h: int,
     input_fs: int,
     tree_fs: int,
+    input_h: int,
 ) -> str:
     c = THEMES[normalize_theme(theme)]
     return f"""
@@ -223,6 +224,7 @@ def build_stylesheet(
             QLabel#DetailStatus {{
                 color: {c.text_muted};
                 font-size: {max(13, fs - 8)}px;
+                padding: 4px 0 0 0;
             }}
             QLabel#Footer {{
                 color: {c.text_soft};
@@ -234,7 +236,7 @@ def build_stylesheet(
                 border: 1px solid {c.group_border};
                 border-radius: 10px;
                 margin-top: 14px;
-                padding-top: 18px;
+                padding: 18px 12px 10px 10px;
                 background: {c.group_bg};
             }}
             QGroupBox::title {{
@@ -269,15 +271,51 @@ def build_stylesheet(
                 color: {c.button_disabled_fg};
                 border: 1px solid {c.button_disabled_border};
             }}
-            QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox {{
+            QLineEdit {{
                 font-size: {input_fs}px;
                 font-weight: 300;
-                padding: 8px 12px;
+                padding: 6px 10px;
                 border: 1px solid {c.input_border};
                 border-radius: 6px;
                 background: {c.input_bg};
                 color: {c.input_text};
-                min-height: 36px;
+                min-height: {input_h}px;
+            }}
+            QComboBox {{
+                font-size: {input_fs}px;
+                font-weight: 300;
+                padding: 6px 28px 6px 10px;
+                border: 1px solid {c.input_border};
+                border-radius: 6px;
+                background: {c.input_bg};
+                color: {c.input_text};
+                min-height: {input_h}px;
+            }}
+            QSpinBox, QDoubleSpinBox {{
+                font-size: {input_fs}px;
+                font-weight: 300;
+                padding: 2px 22px 2px 8px;
+                border: 1px solid {c.input_border};
+                border-radius: 6px;
+                background: {c.input_bg};
+                color: {c.input_text};
+                min-height: {input_h}px;
+            }}
+            QSpinBox::up-button, QSpinBox::down-button,
+            QDoubleSpinBox::up-button, QDoubleSpinBox::down-button {{
+                width: 18px;
+                subcontrol-origin: border;
+                subcontrol-position: right;
+                border: none;
+                background: transparent;
+            }}
+            QComboBox::drop-down {{
+                subcontrol-origin: padding;
+                subcontrol-position: top right;
+                width: 22px;
+                border-left: 1px solid {c.input_border};
+                border-top-right-radius: 5px;
+                border-bottom-right-radius: 5px;
             }}
             QComboBox QAbstractItemView {{
                 background: {c.input_bg};
@@ -356,11 +394,21 @@ def build_stylesheet(
                 padding: 4px 8px;
                 min-width: 96px;
             }}
+            QLabel#ParamLabel {{
+                color: {c.text_muted};
+                font-size: {max(13, fs - 8)}px;
+                font-weight: 400;
+                padding: 0;
+                margin: 0;
+            }}
+            QWidget#ParamField {{
+                margin-bottom: 4px;
+            }}
             QLabel#ChromeModeHint {{
                 color: {c.text_muted};
                 font-size: {max(13, fs - 7)}px;
                 font-weight: 400;
-                padding: 2px 0 6px 0;
+                padding: 6px 0 2px 0;
             }}
             QPushButton#LinkButton {{
                 background: transparent;

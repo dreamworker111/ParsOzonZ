@@ -85,6 +85,7 @@ from .parse_checkpoint import (
 )
 from .session import resolve_storage_state
 from .utils import (
+    extract_ozon_category_id,
     extract_ozon_product_id,
     has_bonus_text,
     human_category_delay,
@@ -100,6 +101,7 @@ from .utils import (
     route_browser_url,
     sanitize_catalog_url,
     with_price_sort_asc,
+    name_from_product_url,
 )
 
 
@@ -440,8 +442,8 @@ class OzonParser:
         self._block_auto_waits_used = 0
         self._global_nav_fallbacks_used = 0
         self._composer_categories_done = 0
-        # Global product collection mirrors specific-seller: page.goto each leaf
-        # (/seller/0/?category=…) + DOM scroll. Composer-first product fetch caused fab_.
+        # Global product collection: open each selected /category/{id}/ listing
+        # and scroll DOM cards. Composer-first product fetch caused fab_.
         self._global_bulk_mode = False
 
         checkpoint = load_checkpoint(settings)
@@ -476,8 +478,8 @@ class OzonParser:
         )
         if settings.parse_mode == PARSE_MODE_GLOBAL_CATEGORIES:
             self.on_progress(
-                "Общий каталог: каждая выбранная категория открывается как "
-                "/seller/0/?category=… без привязки к конкретному магазину."
+                "Общий каталог: каждая отмеченная категория открывается как "
+                "/category/{id}/ (только выбранный раздел, не витрина /seller/)."
             )
         if settings.max_products >= 1000:
             self.on_progress(
@@ -694,9 +696,19 @@ class OzonParser:
                         self._emit_status(timer, idx, total, section, category_label, item_label)
 
                         if settings.parse_mode == PARSE_MODE_GLOBAL_CATEGORIES:
-                            catalog_url = self._build_global_catalog_url(
-                                target,
-                                settings.browser_mode,
+                            try:
+                                catalog_url = self._build_global_catalog_url(
+                                    target,
+                                    settings.browser_mode,
+                                )
+                            except ValueError as exc:
+                                self.on_progress(str(exc))
+                                continue
+                            cat_id = self._resolve_global_category_id(target)
+                            self.on_progress(
+                                "Открываем выбранную категорию "
+                                f"«{target.name or target.category_name or cat_id}» "
+                                f"(id={cat_id}): {catalog_url}"
                             )
                         else:
                             catalog_url = self._catalog_url_for_target(
@@ -1243,54 +1255,50 @@ class OzonParser:
         self,
         category_id: str,
         browser_mode: BrowserMode = DESKTOP_MODE,
+        *,
+        source_url: str = "",
     ) -> str:
         """Product listing for a global category across sellers.
 
-        `/seller/?category=` is a mall/seller feed (triggers empty scrolls → fab_).
-        `/seller/0/?category=` is the real multi-seller product grid.
+        Prefer the real /category/… listing (keeps the selected section).
+        `/seller/0/?category=` often ignores deep ids and shows a mixed mall feed.
         """
-        seller = self._route_url("https://www.ozon.ru/seller/0/", browser_mode)
-        parsed = urlparse(seller)
-        path = parsed.path if parsed.path.endswith("/") else parsed.path + "/"
-        base = urlunparse((parsed.scheme, parsed.netloc, path, "", "", ""))
-        return sanitize_catalog_url(
-            base,
-            param_key="category",
-            param_value=str(category_id),
-            browser_mode=browser_mode,
-            session_mode=self._session_mode,
-            keep_sorting=True,
-        )
+        category_id = str(category_id or "").strip()
+        source = str(source_url or "").strip()
+        if source and "/category/" in source.lower():
+            source_id = extract_ozon_category_id(source)
+            if category_id and source_id == category_id:
+                routed = source if source.startswith("http") else f"https://www.ozon.ru{source}"
+                return sanitize_catalog_url(
+                    routed,
+                    browser_mode=browser_mode,
+                    session_mode=self._session_mode,
+                    keep_sorting=True,
+                )
+        return self._build_global_category_direct_url(category_id, browser_mode)
 
     def _resolve_global_category_id(self, target: CategoryTarget) -> str:
-        for candidate in (target.category_id, target.param_value):
-            value = str(candidate or "").strip()
-            if re.fullmatch(r"\d{2,}", value):
-                return value
-        target_id = str(target.id or "")
-        match = re.search(r"category:(\d+)", target_id)
-        if match:
-            return match.group(1)
-        if target.url and GLOBAL_CATALOG_PATH in target.url:
-            match = re.search(r"/category/(\d+)", target.url)
-            if match:
-                return match.group(1)
-        return ""
+        return extract_ozon_category_id(
+            target.category_id,
+            target.param_value,
+            target.id,
+            target.url,
+        )
 
     def _build_global_catalog_url(
         self,
         target: CategoryTarget,
         browser_mode: BrowserMode = DESKTOP_MODE,
     ) -> str:
-        # Seller filter pages survive antibot checks better than direct /category/ URLs.
         category_id = self._resolve_global_category_id(target)
-        if category_id:
-            return self._global_category_parse_url(category_id, browser_mode)
-        return with_price_sort_asc(
-            self._route_url("https://www.ozon.ru" + ALL_SELLERS_PATH, browser_mode),
-            browser_mode,
-            self._session_mode,
-        )
+        if not category_id:
+            raise ValueError(
+                "Не удалось определить ID категории для "
+                f"«{target.name or target.id}». Отметьте категорию заново."
+            )
+        # Always open the exact selected id. Never reuse a possibly parent-level
+        # source URL even when the slug contains the same digits.
+        return self._build_global_category_direct_url(category_id, browser_mode)
 
     def _build_global_category_direct_url(
         self,
@@ -1778,9 +1786,12 @@ class OzonParser:
             }
             prev = merged.get(key)
             if not prev or tile_score(incoming) > tile_score(prev):
-                # Keep the best name even if another source wins on text.
-                if prev and len(prev.get("name") or "") > len(incoming.get("name") or ""):
-                    incoming["name"] = prev["name"]
+                best_name = pick_product_name(
+                    (prev or {}).get("name"),
+                    incoming.get("name"),
+                )
+                if best_name:
+                    incoming["name"] = best_name
                 merged[key] = incoming
 
         for source in (dom_cards or [], composer_cards or []):
@@ -1805,7 +1816,7 @@ class OzonParser:
                 return m ? m[1] : '';
             };
             const canonicalHref = (href) => String(href || '').split('#')[0].split('?')[0];
-            const noise = /балл|бонус|отзыв|распродаж|суперцен|ценопад|новинка|^хит$|^\\d+\\s*шт\\.?$|осталось\\s+\\d+|в корзину|в избранное|бесплатная доставка|^акция$|^скидка$/i;
+            const noise = /балл|бонус|отзыв|распродаж|суперцен|ценопад|новинка|^хит$|^\\d+\\s*шт\\.?$|осталось\\s+\\d+|в корзину|в избранное|бесплатная доставка|^акция$|^скидка$|бренд\\s*проверен|проверенн?ый\\s*бренд|бренд\\s*подтвержд|официальный\\s*бренд|^оригинал$/i;
             const isNoise = (value) => {
                 if (!value || value.length < 3 || /₽/.test(value)) return true;
                 if (noise.test(value)) return true;
@@ -1956,11 +1967,12 @@ class OzonParser:
                 detail["bonus_points"] = html_detail["bonus_points"]
         detail["url"] = href
 
-        name = pick_product_name(card.get("name")) or pick_product_name(
+        name = pick_product_name(
+            card.get("name"),
             detail.get("name"),
             text,
             re.sub(r"<[^>]+>", "\n", html) if html else "",
-        )
+        ) or name_from_product_url(href)
         price_disc = detail.get("price_discounted")
         price_orig = detail.get("price_original")
         bonus = detail.get("bonus_points")

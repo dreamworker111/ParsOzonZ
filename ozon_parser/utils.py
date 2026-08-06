@@ -55,6 +55,33 @@ def to_desktop_url(url: str) -> str:
     return urlunparse((parsed.scheme or "https", host, parsed.path, parsed.params, parsed.query, parsed.fragment))
 
 
+def extract_ozon_category_id(*candidates: object) -> str:
+    """Pull a numeric Ozon category id from ids, query params, or slug URLs."""
+    for raw in candidates:
+        text = str(raw or "").strip()
+        if not text:
+            continue
+        if re.fullmatch(r"\d{2,}", text):
+            return text
+        match = re.search(r"[?&]category=(\d{2,})\b", text, flags=re.IGNORECASE)
+        if match:
+            return match.group(1)
+        match = re.search(
+            r"/category/[^/?#]*-(\d{2,})(?:[/?#]|$)",
+            text,
+            flags=re.IGNORECASE,
+        )
+        if match:
+            return match.group(1)
+        match = re.search(r"/category/(\d{2,})(?:[/?#]|$)", text, flags=re.IGNORECASE)
+        if match:
+            return match.group(1)
+        match = re.search(r"category:(\d{2,})\b", text, flags=re.IGNORECASE)
+        if match:
+            return match.group(1)
+    return ""
+
+
 def with_price_sort_asc(
     url: str,
     browser_mode: BrowserMode = DESKTOP_MODE,
@@ -231,6 +258,10 @@ _PRODUCT_NAME_NOISE_FULL = re.compile(
     r"|скидка"
     r"|оригинал"
     r"|premium"
+    r"|бренд\s+проверен"
+    r"|проверенн?ый\s+бренд"
+    r"|бренд\s+подтвержд[её]н"
+    r"|официальный\s+бренд"
     r"|выбор\s+покупателей?"
     r"|цена\s+что\s+надо"
     r"|ценопад"
@@ -263,6 +294,11 @@ _PRODUCT_NAME_NOISE_INLINE = re.compile(
     r"|акция"
     r"|ценопад"
     r"|выбор\s+покупателей?"
+    r"|бренд\s+проверен"
+    r"|проверенн?ый\s+бренд"
+    r"|бренд\s+подтвержд[её]н"
+    r"|официальный\s+бренд"
+    r"|оригинал"
     r"|[-−+]\d+\s*%"
     r")(?=\s|$)",
 )
@@ -283,11 +319,37 @@ def is_product_name_noise(text: str | None) -> bool:
         return True
     if _PRODUCT_NAME_NOISE_FULL.match(value):
         return True
+    lowered = value.lower()
+    if "бренд" in lowered and any(
+        marker in lowered for marker in ("провер", "подтвержд", "официал")
+    ):
+        return True
     # Mostly digits / punctuation, no real words.
     letters = re.findall(r"[A-Za-zА-Яа-яЁё]", value)
     if len(letters) < 3 and not re.search(r"[A-Za-zА-Яа-яЁё]{4,}", value):
         return True
     return False
+
+
+def name_from_product_url(url: str | None) -> str:
+    """Fallback title from /product/slug-words-123456/ when card text is only badges."""
+    if not url:
+        return ""
+    match = re.search(
+        r"/product/([^/?#]+?)-(\d{6,})(?:[/?#]|$)",
+        str(url),
+        flags=re.IGNORECASE,
+    )
+    if not match:
+        return ""
+    slug = match.group(1).replace("-", " ").strip()
+    slug = re.sub(r"\s+", " ", slug)
+    # Skip empty / numeric-only / tiny slugs.
+    if len(slug) < 8:
+        return ""
+    if not re.search(r"[A-Za-zА-Яа-яЁё]{3,}", slug):
+        return ""
+    return clean_product_name(slug)
 
 
 def clean_product_name(text: str | None) -> str:
@@ -337,11 +399,16 @@ def pick_product_name(*sources: str | None) -> str:
     if not candidates:
         return ""
 
-    def score(name: str) -> tuple[int, int, int]:
+    def score(name: str) -> tuple[int, int, int, int]:
         words = len(name.split())
         letters = len(re.findall(r"[A-Za-zА-Яа-яЁё]", name))
+        lowered = name.lower()
+        # Heavy penalty for leftover badge phrases that slipped past filters.
+        badge_penalty = 0
+        if "бренд" in lowered or "распродаж" in lowered or "хит" == lowered:
+            badge_penalty = -1000
         # Prefer real titles: longer, more words/letters, not badge-like.
-        return (letters, words, len(name))
+        return (badge_penalty, letters, words, len(name))
 
     return max(candidates, key=score)
 

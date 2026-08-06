@@ -172,6 +172,166 @@ class GuiModeSmokeTests(unittest.TestCase):
         self.assertEqual(target.name, "Электроника → Смартфоны → Android")
         self.assertEqual(target.parent_name, "Смартфоны")
 
+    def test_checked_root_with_unchecked_children_does_not_parse_root(self):
+        """Regression: after subcategory load, root stays checked but kids unchecked.
+
+        Parsing must not fall back to the whole root (e.g. Electronics).
+        """
+        tree = FilterTreeWidget()
+        leaf = FilterOptionNode(
+            id="leaf",
+            name="Заколки",
+            url="https://www.ozon.ru/category/3/",
+            param_key="category",
+            param_value="3",
+            category_id="3",
+            category_name="Заколки",
+        )
+        root = FilterOptionNode(
+            id="root",
+            name="Электроника",
+            url="https://www.ozon.ru/category/1/",
+            param_key="category",
+            param_value="1",
+            category_id="1",
+            category_name="Электроника",
+            children=[leaf],
+        )
+        tree.populate_categories([root])
+        root_item = tree.topLevelItem(0)
+        leaf_item = root_item.child(0)
+
+        # Simulate inconsistent state after blocked-signal subcategory restore.
+        tree._block_signals = True
+        root_item.setCheckState(0, Qt.CheckState.Checked)
+        leaf_item.setCheckState(0, Qt.CheckState.Unchecked)
+        tree._block_signals = False
+
+        self.assertEqual(tree.selected_leaf_categories(), [])
+
+        leaf_item.setCheckState(0, Qt.CheckState.Checked)
+        selected = tree.selected_leaf_categories()
+        self.assertEqual(len(selected), 1)
+        self.assertEqual(selected[0].category_id, "3")
+        self.assertIn("Заколки", selected[0].name)
+
+    def test_finalize_catalog_load_clears_checks_for_explicit_leaf_pick(self):
+        tree = FilterTreeWidget()
+        tree.set_initial_roots(
+            [
+                FilterOptionNode(
+                    id="root",
+                    name="Электроника",
+                    url="https://www.ozon.ru/category/1/",
+                    param_key="category",
+                    param_value="1",
+                    category_id="1",
+                    category_name="Электроника",
+                )
+            ],
+            pending_subcategories=True,
+        )
+        root_item = tree.topLevelItem(0)
+        root_item.setCheckState(0, Qt.CheckState.Checked)
+
+        tree.finalize_catalog_load(
+            [
+                FilterOptionNode(
+                    id="root",
+                    name="Электроника",
+                    url="https://www.ozon.ru/category/1/",
+                    param_key="category",
+                    param_value="1",
+                    category_id="1",
+                    category_name="Электроника",
+                    children=[
+                        FilterOptionNode(
+                            id="leaf",
+                            name="Смартфоны",
+                            url="https://www.ozon.ru/category/2/",
+                            param_key="category",
+                            param_value="2",
+                            category_id="2",
+                            category_name="Смартфоны",
+                        )
+                    ],
+                )
+            ]
+        )
+        root_item = tree.topLevelItem(0)
+        self.assertEqual(root_item.checkState(0), Qt.CheckState.Unchecked)
+        self.assertEqual(tree.selected_leaf_categories(), [])
+        leaf = root_item.child(0)
+        leaf.setCheckState(0, Qt.CheckState.Checked)
+        self.assertEqual(tree.selected_leaf_categories()[0].category_id, "2")
+
+    def test_selected_leaves_ignore_ancestor_ids_relisted_as_children(self):
+        """Junk parent nodes under a deep branch must not be parsed."""
+        tree = FilterTreeWidget()
+        leaf_pins = FilterOptionNode(
+            id="pins",
+            name="Заколки",
+            url="https://www.ozon.ru/category/17033/",
+            param_key="category",
+            param_value="17033",
+            category_id="17033",
+            category_name="Заколки",
+        )
+        leaf_combs = FilterOptionNode(
+            id="combs",
+            name="Гребни",
+            url="https://www.ozon.ru/category/17034/",
+            param_key="category",
+            param_value="17034",
+            category_id="17034",
+            category_name="Гребни",
+        )
+        junk_parent = FilterOptionNode(
+            id="junk",
+            name="Женские аксессуары",
+            url="https://www.ozon.ru/category/17000/",
+            param_key="category",
+            param_value="17000",
+            category_id="17000",
+            category_name="Женские аксессуары",
+        )
+        hair = FilterOptionNode(
+            id="hair",
+            name="Аксессуары для волос",
+            url="https://www.ozon.ru/category/17047/",
+            param_key="category",
+            param_value="17047",
+            category_id="17047",
+            category_name="Аксессуары для волос",
+            children=[leaf_pins, leaf_combs, junk_parent],
+        )
+        women = FilterOptionNode(
+            id="women",
+            name="Женские аксессуары",
+            url="https://www.ozon.ru/category/17000/",
+            param_key="category",
+            param_value="17000",
+            category_id="17000",
+            category_name="Женские аксессуары",
+            children=[hair],
+        )
+        tree.populate_categories([women])
+
+        women_item = tree.topLevelItem(0)
+        hair_item = women_item.child(0)
+        pins_item = hair_item.child(0)
+        combs_item = hair_item.child(1)
+        junk_item = hair_item.child(2)
+
+        pins_item.setCheckState(0, Qt.CheckState.Checked)
+        combs_item.setCheckState(0, Qt.CheckState.Checked)
+        junk_item.setCheckState(0, Qt.CheckState.Checked)
+
+        selected = tree.selected_leaf_categories()
+        ids = sorted(t.category_id for t in selected)
+        self.assertEqual(ids, ["17033", "17034"])
+        self.assertTrue(all("/category/1703" in (t.url or "") for t in selected))
+
     def test_parse_mode_combo_controls_link_input(self):
         from ozon_parser.config import PARSE_MODE_GLOBAL_CATEGORIES, PARSE_MODE_SELLER_FULL
 

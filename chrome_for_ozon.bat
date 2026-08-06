@@ -25,7 +25,7 @@ echo.
 echo Не закрывайте это окно пока работает парсер.
 echo.
 
-start "" "%CHROME%" --remote-debugging-port=%PORT% --user-data-dir="%PROFILE%" --no-first-run --no-default-browser-check https://www.ozon.ru/seller/
+start "" "%CHROME%" --remote-debugging-port=%PORT% --user-data-dir="%PROFILE%" --no-first-run --no-default-browser-check about:blank
 
 echo Chrome запущен. Теперь запустите парсер.
 pause

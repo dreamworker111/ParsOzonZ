@@ -15,7 +15,7 @@ from .auth import (
     mobile_browser_profile_dir,
     mobile_guest_profile_dir,
 )
-from .chrome_launcher import ensure_chrome_for_ozon
+from .chrome_launcher import ensure_chrome_for_ozon, restart_chrome_for_ozon
 from .config import (
     ANTIBOT_WAIT_TIMEOUT_SEC,
     BLOCK_COOLDOWN_MAX,
@@ -122,7 +122,187 @@ def _apply_mobile_stealth(context: BrowserContext) -> None:
         pass
 
 
-def connect_via_cdp(playwright: Playwright, progress=None) -> tuple[Browser, BrowserContext, Page]:
+NETWORK_PROBE_CONTROL_URL = "https://example.com/"
+OZON_NETWORK_BLOCK_HINT = (
+    "Сайт ozon.ru недоступен с вашего компьютера (net::ERR_FAILED), "
+    "хотя интернет в Chrome работает. Обычно это временная блокировка IP "
+    "после частых запросов к Ozon, VPN/прокси или фильтр провайдера.\n"
+    "Откройте https://www.ozon.ru/ вручную в окне Chrome парсера "
+    "(chrome_for_ozon.bat). Если страница не грузится — подождите 15–30 минут, "
+    "отключите VPN или смените сеть, затем повторите «Загрузить категории»."
+)
+
+
+def _is_transient_goto_error(exc: Exception) -> bool:
+    text = str(exc).lower()
+    return any(
+        marker in text
+        for marker in (
+            "err_failed",
+            "err_aborted",
+            "err_connection",
+            "err_name_not_resolved",
+            "err_internet_disconnected",
+            "err_address_unreachable",
+            "net::",
+            "timeout",
+            "target closed",
+            "crashed",
+            "chrome-error://",
+        )
+    )
+
+
+def _is_chrome_error_url(url: str) -> bool:
+    return (url or "").lower().startswith("chrome-error:")
+
+
+def probe_chrome_network(page: Page, log: Callable[[str], None] | None = None) -> tuple[bool, bool]:
+    """Return (internet_ok, ozon_ok) using the live Chrome tab."""
+    progress = log or (lambda _m: None)
+    internet_ok = False
+    ozon_ok = False
+    probe = page.context.new_page()
+    try:
+        try:
+            probe.goto(
+                NETWORK_PROBE_CONTROL_URL,
+                wait_until="domcontentloaded",
+                timeout=20000,
+            )
+            internet_ok = "example.com" in (probe.url or "").lower()
+        except Exception as exc:
+            progress(f"Проверка интернета в Chrome: {exc}")
+
+        if internet_ok:
+            try:
+                probe.goto(
+                    DESKTOP_BASE_URL.rstrip("/") + "/",
+                    wait_until="domcontentloaded",
+                    timeout=25000,
+                )
+                ozon_ok = "ozon.ru" in (probe.url or "").lower() and not _is_chrome_error_url(
+                    probe.url
+                )
+            except Exception as exc:
+                progress(f"Проверка доступа к Ozon: {exc}")
+    finally:
+        try:
+            probe.close()
+        except Exception:
+            pass
+    return internet_ok, ozon_ok
+
+
+def log_ozon_network_failure(
+    page: Page,
+    log: Callable[[str], None],
+    *,
+    prefix: str = "",
+) -> None:
+    """Explain ERR_FAILED when Ozon is blocked at the network level."""
+    internet_ok, ozon_ok = probe_chrome_network(page, log)
+    if internet_ok and not ozon_ok:
+        if prefix:
+            log(prefix)
+        log(OZON_NETWORK_BLOCK_HINT)
+        return
+    if not internet_ok:
+        log(
+            (prefix + " " if prefix else "")
+            + "Chrome не может выйти в интернет. Проверьте подключение, "
+            "прокси и антивирус, затем перезапустите chrome_for_ozon.bat."
+        )
+        return
+    if prefix:
+        log(prefix)
+
+
+def _acquire_cdp_page(context: BrowserContext, log: Callable[[str], None]) -> Page:
+    """Pick a healthy CDP tab or open a fresh one."""
+    for candidate in list(context.pages):
+        try:
+            if candidate.is_closed():
+                continue
+            url = (candidate.url or "").lower()
+            if _is_chrome_error_url(url):
+                log("Сброс вкладки Chrome после ошибки запуска...")
+                try:
+                    candidate.goto("about:blank", wait_until="commit", timeout=20000)
+                    if not _is_chrome_error_url(candidate.url):
+                        return candidate
+                except Exception:
+                    pass
+                try:
+                    candidate.close()
+                except Exception:
+                    pass
+                continue
+            return candidate
+        except Exception:
+            continue
+    page = context.new_page()
+    try:
+        page.goto("about:blank", wait_until="commit", timeout=20000)
+    except Exception:
+        pass
+    return page
+
+
+def _reset_page_to_blank(page: Page) -> None:
+    try:
+        if page.is_closed():
+            return
+    except Exception:
+        return
+    try:
+        page.goto("about:blank", wait_until="commit", timeout=30000)
+    except Exception:
+        pass
+
+
+def _goto_page(
+    page: Page,
+    url: str,
+    log: Callable[[str], None],
+    *,
+    timeout: int = 90000,
+) -> bool:
+    """Navigate with blank-tab recovery for transient CDP/network failures."""
+    attempts: list[tuple[str, bool]] = [
+        ("domcontentloaded", False),
+        ("commit", False),
+        ("domcontentloaded", True),
+        ("commit", True),
+    ]
+    last_exc: Exception | None = None
+    for wait_until, reset_blank in attempts:
+        try:
+            if reset_blank:
+                _reset_page_to_blank(page)
+                human_delay(1.0, 2.0)
+            page.goto(url, wait_until=wait_until, timeout=timeout)
+            if _is_chrome_error_url(page.url):
+                raise RuntimeError(f"Page.goto: chrome-error after {url}")
+            return True
+        except Exception as exc:
+            last_exc = exc
+            if not _is_transient_goto_error(exc):
+                log(f"Ошибка загрузки: {exc}")
+                return False
+            log(f"Ошибка загрузки: {exc}")
+            human_delay(2.0, 3.5)
+    if last_exc is not None:
+        log(f"Ошибка загрузки: {last_exc}")
+    return False
+
+
+def connect_via_cdp(
+    playwright: Playwright,
+    progress=None,
+    *,
+    restart_on_error: bool = True,
+) -> tuple[Browser, BrowserContext, Page]:
     log = progress or (lambda _m: None)
     if not ensure_chrome_for_ozon(log):
         raise RuntimeError(
@@ -131,7 +311,20 @@ def connect_via_cdp(playwright: Playwright, progress=None) -> tuple[Browser, Bro
         )
     browser = playwright.chromium.connect_over_cdp(CDP_URL)
     context = browser.contexts[0] if browser.contexts else browser.new_context()
-    page = context.pages[0] if context.pages else context.new_page()
+    page = _acquire_cdp_page(context, log)
+
+    if restart_on_error:
+        try:
+            current = page.url or ""
+        except Exception:
+            current = ""
+        if _is_chrome_error_url(current):
+            log("Chrome не может открыть страницы — перезапуск...")
+            if restart_chrome_for_ozon(log):
+                browser = playwright.chromium.connect_over_cdp(CDP_URL)
+                context = browser.contexts[0] if browser.contexts else browser.new_context()
+                page = _acquire_cdp_page(context, log)
+
     return browser, context, page
 
 
@@ -506,11 +699,16 @@ def ensure_ozon_session_ready(
 
     if "ozon.ru" not in current:
         log("Подготовка сессии Ozon...")
-        try:
-            page.goto(target, wait_until="domcontentloaded", timeout=90000)
-            human_delay(2.0, 4.0)
-        except Exception as exc:
-            log(f"Прогрев Ozon: {exc}")
+        if not _goto_page(page, target, log):
+            log_ozon_network_failure(
+                page,
+                log,
+                prefix=(
+                    "Не удалось открыть Ozon. "
+                    "Закройте лишние окна Chrome и повторите «Загрузить категории»."
+                ),
+            )
+            return False
     elif is_antibot_challenge_page(page):
         log("Ozon проверяет браузер, ожидаем без перезагрузки...")
 
@@ -965,7 +1163,11 @@ def safe_goto(
 
             current = _normalize_url(page.url)
             if current != target:
-                page.goto(url, wait_until="domcontentloaded", timeout=90000)
+                if not _goto_page(page, url, log):
+                    if attempt < retries and not is_access_restricted(page):
+                        human_delay(3.0, 5.0)
+                        continue
+                    return False
             human_delay(2.0, 4.0)
             if not wait_for_ozon_ready(page, log):
                 if is_blocked_page(page):
@@ -1010,6 +1212,8 @@ def safe_goto(
         except Exception as exc:
             log(f"Ошибка загрузки: {exc}")
             if attempt < retries and not is_access_restricted(page):
+                if _is_transient_goto_error(exc):
+                    _reset_page_to_blank(page)
                 human_delay(3.0, 5.0)
             else:
                 return False

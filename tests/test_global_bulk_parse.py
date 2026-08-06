@@ -72,11 +72,11 @@ class ContinuousWaveBudgetTests(unittest.TestCase):
         self.assertEqual(cats, GLOBAL_SESSION_MAX_CATEGORIES)
         self.assertLessEqual(products, 60)
 
-    def test_global_urls_use_seller_zero_product_grid(self):
+    def test_global_urls_use_category_product_listing(self):
         for target in _make_targets(20):
             url = self.parser._build_global_catalog_url(target, DESKTOP_MODE)
-            self.assertIn("/seller/0/", url)
-            self.assertIn(f"category={target.category_id}", url)
+            self.assertIn(f"/category/{target.category_id}", url)
+            self.assertNotIn("/seller/0/", url)
             self.assertNotRegex(url, r"/seller/\?category=")
 
     def test_product_batch_pause_emits_progress(self):
@@ -160,14 +160,11 @@ class ContinuousParseRunTests(unittest.TestCase):
             products, _stats = parser.run(settings)
 
         self.assertEqual(products, [])
-        # Seller-like: one /seller/0/?category=… navigation per selected leaf.
+        # One /category/{id}/ navigation per selected leaf.
         self.assertEqual(len(opened_urls), len(targets))
-        self.assertTrue(all("/seller/0/" in u for u in opened_urls))
-        self.assertTrue(all("category=" in u for u in opened_urls))
+        self.assertTrue(all("/category/" in u for u in opened_urls))
+        self.assertTrue(all("sorting=price" in u for u in opened_urls))
         self.assertFalse(parser._global_bulk_mode)
-        self.assertTrue(
-            any("как у магазина" in msg.lower() or "seller/0" in msg.lower() for msg in logs)
-        )
 
     def test_fab_block_stops_without_retry_navigation(self):
         targets = _make_targets(1000)

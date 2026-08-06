@@ -94,8 +94,7 @@ class GlobalProductCollectionRegressionTests(unittest.TestCase):
 
         self.assertEqual(len(products), 1)
         self.assertEqual(products[0].bonus_points, 150)
-        self.assertTrue(any("/seller/0/" in url for url in opened))
-        self.assertTrue(any("category=15500" in url for url in opened))
+        self.assertTrue(any("/category/15500" in url for url in opened))
         self.assertFalse(any("Пустая выдача" in msg for msg in logs))
 
 

@@ -37,6 +37,7 @@ class ThemePreferenceTests(unittest.TestCase):
             btn_h=44,
             input_fs=14,
             tree_fs=16,
+            input_h=40,
         )
         light = theme.build_stylesheet(
             "light",
@@ -46,6 +47,7 @@ class ThemePreferenceTests(unittest.TestCase):
             btn_h=44,
             input_fs=14,
             tree_fs=16,
+            input_h=40,
         )
         self.assertIn(theme.DARK.window_bg, dark)
         self.assertIn(theme.LIGHT.window_bg, light)

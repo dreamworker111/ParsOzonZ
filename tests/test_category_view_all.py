@@ -133,6 +133,23 @@ class ViewAllCategoriesTests(unittest.TestCase):
         self.assertEqual([n["id"] for n in seeds], ["10", "20"])
         self.assertTrue(all(n["children"] == [] for n in seeds))
 
+    def test_resolve_seeds_excludes_ancestor_ids(self) -> None:
+        page = Mock()
+        loader = CategoryLoader(page)
+        loader._seller_root_ids = {"17000"}
+        dom = [
+            {"id": "17033", "name": "Заколки", "children": []},
+            {"id": "17000", "name": "Женские аксессуары", "children": []},
+            {"id": "17047", "name": "Аксессуары для волос", "children": []},
+        ]
+        seeds = loader._resolve_direct_child_seeds(
+            dom,
+            parent_id="17047",
+            api_children=dom,
+            ancestor_ids={"17000", "17047"},
+        )
+        self.assertEqual([n["id"] for n in seeds], ["17033"])
+
     def test_resolve_seeds_keeps_view_all_extras_over_truncated_composer(self) -> None:
         page = Mock()
         loader = CategoryLoader(page)
@@ -352,6 +369,114 @@ class ViewAllCategoriesTests(unittest.TestCase):
         self.assertEqual(root["children"][1]["children"], [])
         # 11 is visited to confirm it is a leaf.
         self.assertEqual(calls, ["1", "10", "11", "20"])
+
+    def test_collect_branch_in_shop_mode_keeps_direct_children_even_if_flagged_deeper(self) -> None:
+        page = Mock()
+        loader = CategoryLoader(page)
+        root = {"id": "10", "name": "Root", "children": []}
+        calls: list[str] = []
+
+        def fake_fetch(_base, parent, _log, _bypass):
+            calls.append(str(parent["id"]))
+            if str(parent["id"]) == "10":
+                return [
+                    {"id": "11", "name": "Audio", "children": []},
+                ]
+            if str(parent["id"]) == "11":
+                return [{"id": "12", "name": "Headphones", "children": []}]
+            return []
+
+        def fake_batch(_base, ids, _log):
+            # Bug case: Composer marks direct child 11 as "deeper".
+            loader._composer_deeper_ids = {
+                "10": {"11"},
+                "11": set(),
+            }
+            mapping = {
+                "10": [{"id": "11", "name": "Audio", "children": []}],
+                "11": [{"id": "12", "name": "Headphones", "children": []}],
+                "12": [],
+            }
+            return {cid: list(mapping.get(cid, [])) for cid in ids}
+
+        with (
+            patch.object(loader, "_fetch_category_subtree", side_effect=fake_fetch),
+            patch.object(loader, "_fetch_categories_batch", side_effect=fake_batch),
+            patch("ozon_parser.categories.human_delay"),
+            patch("ozon_parser.categories.is_access_restricted", return_value=False),
+            patch("ozon_parser.categories.is_blocked_page", return_value=False),
+        ):
+            loader._collect_category_branch_whole(
+                "https://www.ozon.ru/seller/shop-1/",
+                root,
+                log=lambda _m: None,
+                on_manual_bypass=None,
+                page_max_depth=15,
+            )
+
+        self.assertEqual(calls, ["10", "11", "12"])
+        self.assertEqual([c["id"] for c in root["children"]], ["11"])
+        self.assertEqual(root["children"][0]["children"][0]["id"], "12")
+
+    def test_collect_branch_skips_deeper_ids_when_dom_is_nested(self) -> None:
+        page = Mock()
+        loader = CategoryLoader(page)
+        root = {"id": "1", "name": "Root", "children": []}
+        calls: list[str] = []
+
+        def fake_fetch(_base, parent, _log, _bypass):
+            calls.append(str(parent["id"]))
+            if str(parent["id"]) == "1":
+                return [
+                    {
+                        "id": "10",
+                        "name": "Women",
+                        "children": [
+                            {"id": "11", "name": "Hair", "children": []},
+                        ],
+                    }
+                ]
+            if str(parent["id"]) == "10":
+                return [
+                    {
+                        "id": "11",
+                        "name": "Hair",
+                        "children": [{"id": "12", "name": "Clips", "children": []}],
+                    }
+                ]
+            if str(parent["id"]) == "11":
+                return [{"id": "12", "name": "Clips", "children": []}]
+            return []
+
+        def fake_batch(_base, ids, _log):
+            loader._composer_deeper_ids = {
+                "10": {"11"},
+                "11": {"12"},
+            }
+            return {cid: [] for cid in ids}
+
+        with (
+            patch.object(loader, "_fetch_category_subtree", side_effect=fake_fetch),
+            patch.object(loader, "_fetch_categories_batch", side_effect=fake_batch),
+            patch("ozon_parser.categories.human_delay"),
+            patch("ozon_parser.categories.is_access_restricted", return_value=False),
+            patch("ozon_parser.categories.is_blocked_page", return_value=False),
+        ):
+            loader._collect_category_branch_whole(
+                "https://www.ozon.ru/category/",
+                root,
+                log=lambda _m: None,
+                on_manual_bypass=None,
+                page_max_depth=15,
+            )
+
+        self.assertEqual(calls, ["1", "10", "11", "12"])
+        self.assertEqual([c["id"] for c in root["children"]], ["10"])
+        self.assertEqual(root["children"][0]["children"][0]["id"], "11")
+        self.assertEqual(
+            root["children"][0]["children"][0]["children"][0]["id"],
+            "12",
+        )
 
     def test_collect_branch_switches_to_composer_after_page_depth(self) -> None:
         page = Mock()

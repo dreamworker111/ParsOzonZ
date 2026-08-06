@@ -10,7 +10,7 @@ class GlobalCatalogParseUrlTests(unittest.TestCase):
         self.parser = OzonParser()
         self.parser._session_mode = "cdp"
 
-    def test_global_url_uses_seller_filter_not_category_path(self):
+    def test_global_url_uses_category_listing_not_seller_mall(self):
         target = CategoryTarget(
             id="Категория|category:15500",
             name="Электроника",
@@ -21,11 +21,10 @@ class GlobalCatalogParseUrlTests(unittest.TestCase):
         )
         url = self.parser._build_global_catalog_url(target, DESKTOP_MODE)
 
-        self.assertIn("/seller/0/", url)
-        self.assertIn("category=15500", url)
-        self.assertNotIn("/category/15500", url)
-        self.assertIn("sorting=price", url)
+        self.assertIn("/category/15500", url)
+        self.assertNotIn("/seller/0/", url)
         self.assertNotRegex(url, r"/seller/\?category=")
+        self.assertIn("sorting=price", url)
 
     def test_global_url_resolves_id_from_tree_key(self):
         target = CategoryTarget(
@@ -37,6 +36,19 @@ class GlobalCatalogParseUrlTests(unittest.TestCase):
 
         self.assertEqual(category_id, "25000")
 
+    def test_global_url_uses_numeric_category_path(self):
+        target = CategoryTarget(
+            id="Категория|category:17033",
+            name="Заколки",
+            url="https://www.ozon.ru/category/zakolki-17033/",
+            category_id="17033",
+            param_value="17033",
+        )
+        url = self.parser._build_global_catalog_url(target, DESKTOP_MODE)
+        self.assertIn("/category/17033/", url)
+        self.assertIn("sorting=price", url)
+        self.assertNotIn("zakolki", url)
+
     def test_mobile_guest_cdp_keeps_www_host_for_global_parse(self):
         self.parser._session_mode = "mobile_guest_cdp"
         target = CategoryTarget(
@@ -47,7 +59,7 @@ class GlobalCatalogParseUrlTests(unittest.TestCase):
         url = self.parser._build_global_catalog_url(target, MOBILE_MODE)
 
         self.assertIn("www.ozon.ru", url)
-        self.assertIn("category=15500", url)
+        self.assertIn("/category/15500", url)
         self.assertNotIn("m.ozon.ru", url)
 
 

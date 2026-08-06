@@ -11,7 +11,6 @@ from PyQt6.QtWidgets import (
     QDialog,
     QDialogButtonBox,
     QDoubleSpinBox,
-    QGridLayout,
     QGroupBox,
     QHBoxLayout,
     QInputDialog,
@@ -58,6 +57,7 @@ from ozon_parser.parse_checkpoint import (
     describe_checkpoint,
 )
 from ozon_parser.parser import OzonParser, ParseSettings
+from ozon_parser.utils import extract_ozon_category_id
 from ozon_parser.theme import (
     THEMES,
     ThemeName,
@@ -91,6 +91,68 @@ def setup_action_button(button: QPushButton, min_height: int = 56) -> None:
     button.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum)
     button.setMinimumHeight(min_height)
     button.setMaximumWidth(16777215)
+
+
+def setup_param_input(widget: QWidget, *, min_height: int = 40) -> None:
+    widget.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+    widget.setMinimumHeight(min_height)
+
+
+class WrapLabel(QLabel):
+    """Label with word wrap that reserves enough vertical space for all lines."""
+
+    def __init__(self, text: str = "", parent: QWidget | None = None):
+        super().__init__(text, parent)
+        self.setWordWrap(True)
+        self.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
+        self.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Minimum)
+
+    def setText(self, text: str) -> None:  # type: ignore[override]
+        super().setText(text)
+        self._sync_wrap_height()
+
+    def resizeEvent(self, event) -> None:  # noqa: N802
+        super().resizeEvent(event)
+        self._sync_wrap_height()
+
+    def showEvent(self, event) -> None:  # noqa: N802
+        super().showEvent(event)
+        self._sync_wrap_height()
+
+    def _sync_wrap_height(self) -> None:
+        if self.maximumHeight() > 0 and self.maximumHeight() < 16777215:
+            # Capped labels (e.g. DetailStatus) must not grow and push buttons away.
+            return
+        width = self.contentsRect().width()
+        if width <= 0:
+            width = self.width()
+        if width <= 0:
+            return
+        height = self.heightForWidth(width)
+        if height > 0:
+            self.setMinimumHeight(height)
+
+
+def make_param_label(text: str) -> WrapLabel:
+    label = WrapLabel(text)
+    label.setObjectName("ParamLabel")
+    return label
+
+
+def param_field_block(label: WrapLabel | str, widget: QWidget, *, spacing: int = 8) -> QWidget:
+    if isinstance(label, str):
+        label = make_param_label(label)
+    setup_param_input(widget)
+    block = QWidget()
+    block.setObjectName("ParamField")
+    block.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum)
+    row = QVBoxLayout(block)
+    row.setContentsMargins(0, 0, 0, 0)
+    row.setSpacing(spacing)
+    row.setSizeConstraint(QVBoxLayout.SizeConstraint.SetMinimumSize)
+    row.addWidget(label)
+    row.addWidget(widget)
+    return block
 
 
 
@@ -291,22 +353,23 @@ class FilterTreeWidget(QTreeWidget):
         else:
             idx = self.indexOfTopLevelItem(item)
             if idx >= 0:
-                saved = item.checkState(0)
                 self.takeTopLevelItem(idx)
                 self.insertTopLevelItem(idx, new_item)
-                new_item.setCheckState(0, saved)
             else:
                 parent = item.parent()
                 if parent is not None:
                     idx = parent.indexOfChild(item)
-                    saved = item.checkState(0)
                     parent.takeChild(idx)
                     parent.insertChild(idx, new_item)
-                    new_item.setCheckState(0, saved)
                 else:
                     self.addTopLevelItem(new_item)
+        # After subcategory load, leave the branch unchecked so the user
+        # must pick concrete leaves — avoids parsing the whole root.
+        new_item.setCheckState(0, Qt.CheckState.Unchecked)
+        self._set_children_state(new_item, Qt.CheckState.Unchecked)
         self._expand_item_branch(new_item)
         self._block_signals = False
+        self._emit_selection_count()
         self.scrollToItem(new_item)
 
     def _finalize_subcategory_placeholders(self, item: QTreeWidgetItem) -> None:
@@ -346,6 +409,13 @@ class FilterTreeWidget(QTreeWidget):
             if not param:
                 continue
             item = self._find_item_by_param_value(param)
+            # Incremental branch_loaded already filled this root — do not rebuild
+            # (rebuild was duplicating deep leaves in the UI).
+            if item is not None and self._checkable_child_count(item) > 0:
+                self._finalize_subcategory_placeholders(item)
+                item.setCheckState(0, Qt.CheckState.Unchecked)
+                self._set_children_state(item, Qt.CheckState.Unchecked)
+                continue
             depth = self._item_depth(item) if item is not None else 0
             path_prefix = ""
             if item is not None and item.parent() is not None:
@@ -365,19 +435,18 @@ class FilterTreeWidget(QTreeWidget):
             else:
                 idx = self.indexOfTopLevelItem(item)
                 if idx >= 0:
-                    saved = item.checkState(0)
                     self.takeTopLevelItem(idx)
                     self.insertTopLevelItem(idx, new_item)
-                    new_item.setCheckState(0, saved)
                 else:
                     # Non-top-level match: replace in place via parent.
                     parent = item.parent()
                     if parent is not None:
                         idx = parent.indexOfChild(item)
-                        saved = item.checkState(0)
                         parent.takeChild(idx)
                         parent.insertChild(idx, new_item)
-                        new_item.setCheckState(0, saved)
+            # Clear checks after tree fill — user picks leaves for parsing.
+            new_item.setCheckState(0, Qt.CheckState.Unchecked)
+            self._set_children_state(new_item, Qt.CheckState.Unchecked)
         for i in range(self.topLevelItemCount()):
             self._finalize_subcategory_placeholders(self.topLevelItem(i))
             self._expand_item_branch(self.topLevelItem(i))
@@ -392,15 +461,16 @@ class FilterTreeWidget(QTreeWidget):
             item = self._find_item_by_param_value(parent_id)
             if not item or not children:
                 continue
-            saved_state = item.checkState(0)
             while item.childCount():
                 item.removeChild(item.child(0))
             for child in children:
                 item.addChild(self._create_option_item("Категория", child, depth=self._item_depth(item) + 1))
                 added += 1
-            item.setCheckState(0, saved_state)
+            item.setCheckState(0, Qt.CheckState.Unchecked)
+            self._set_children_state(item, Qt.CheckState.Unchecked)
             item.setExpanded(True)
         self._block_signals = False
+        self._emit_selection_count()
         return added
 
     def _find_item_by_param_value(self, param_value: str) -> QTreeWidgetItem | None:
@@ -661,10 +731,16 @@ class FilterTreeWidget(QTreeWidget):
             CategoryTarget(
                 id=str(option_id),
                 name=display,
-                url=item.data(0, self.ROLE_URL),
+                # Always bind parse URL to this node's own id — ROLE_URL from Ozon
+                # menus often points at a parent listing.
+                url=(
+                    f"https://www.ozon.ru/category/{cat_id}/"
+                    if cat_id.isdigit()
+                    else item.data(0, self.ROLE_URL)
+                ),
                 section=section,
                 param_key=str(item.data(0, self.ROLE_PARAM_KEY) or ""),
-                param_value=str(item.data(0, self.ROLE_PARAM_VALUE) or ""),
+                param_value=str(item.data(0, self.ROLE_PARAM_VALUE) or "") or cat_id,
                 category_id=cat_id,
                 category_name=str(item.data(0, self.ROLE_CATEGORY_NAME) or raw_name),
                 parent_name=parent_name,
@@ -682,11 +758,33 @@ class FilterTreeWidget(QTreeWidget):
                 return True
         return False
 
+    def _ancestor_category_ids(self, item: QTreeWidgetItem) -> set[str]:
+        ids: set[str] = set()
+        parent = item.parent()
+        while parent is not None:
+            if parent.flags() & Qt.ItemFlag.ItemIsUserCheckable:
+                cid = str(
+                    parent.data(0, self.ROLE_CATEGORY_ID)
+                    or parent.data(0, self.ROLE_PARAM_VALUE)
+                    or ""
+                ).strip()
+                if cid:
+                    ids.add(cid)
+            parent = parent.parent()
+        return ids
+
     def selected_targets(self) -> list[CategoryTarget]:
         """Leaf targets for parsing.
 
         Parent checkbox still marks all children in the UI; for parsing we walk
         down to leaves so each child is processed one-by-one in order.
+
+        If a parent is Checked but has checkable children (e.g. after subcategory
+        load with signals blocked), never treat the parent itself as the parse
+        target — only explicitly checked leaves/descendants are used.
+
+        Also drop junk nodes that re-list an ancestor category id under a deeper
+        branch (common for Ozon accessory menus).
         """
         targets: list[CategoryTarget] = []
 
@@ -700,22 +798,55 @@ class FilterTreeWidget(QTreeWidget):
             if state == Qt.CheckState.Unchecked:
                 return
 
-            if state == Qt.CheckState.PartiallyChecked:
+            # Any parent with real subcategory checkboxes → walk children only.
+            if self._checkable_child_count(item) > 0:
                 for i in range(item.childCount()):
                     walk(item.child(i))
                 return
 
-            # Checked parent with children → parse children sequentially, not the parent.
-            if self._has_checked_descendant(item):
-                for i in range(item.childCount()):
-                    walk(item.child(i))
+            if state == Qt.CheckState.PartiallyChecked:
+                return
+
+            cid = str(
+                item.data(0, self.ROLE_CATEGORY_ID)
+                or item.data(0, self.ROLE_PARAM_VALUE)
+                or ""
+            ).strip()
+            # Parent section re-listed as a fake leaf — never parse it.
+            if cid and cid in self._ancestor_category_ids(item):
                 return
 
             self._append_target(item, targets)
 
         for i in range(self.topLevelItemCount()):
             walk(self.topLevelItem(i))
-        return targets
+
+        # If both a broad parent id and a deeper leaf id somehow got selected,
+        # keep only the deepest ids (drop ids that are ancestors of others).
+        if len(targets) <= 1:
+            return targets
+
+        kept: list[CategoryTarget] = []
+        for target in targets:
+            cid = str(target.category_id or target.param_value or "").strip()
+            if not cid:
+                continue
+            # Drop this target if some OTHER selected node is under the same branch
+            # and this cid is an ancestor of that other node.
+            is_ancestor_of_other = False
+            for other in targets:
+                other_cid = str(other.category_id or other.param_value or "").strip()
+                if not other_cid or other_cid == cid:
+                    continue
+                other_item = self._find_item_by_param_value(other_cid)
+                if other_item is None:
+                    continue
+                if cid in self._ancestor_category_ids(other_item):
+                    is_ancestor_of_other = True
+                    break
+            if not is_ancestor_of_other:
+                kept.append(target)
+        return kept or targets
 
     def selected_checked_categories(self) -> list[CategoryTarget]:
         """Явно отмеченные категории (без каскада на детей)."""
@@ -1054,9 +1185,11 @@ class MainWindow(QMainWindow):
         params_group = QGroupBox("Параметры парсинга")
         params_group.setObjectName("ParamsGroup")
         params_group.setSizePolicy(col_policy)
-        params_group.setMinimumWidth(260)
+        params_group.setMinimumWidth(320)
         params_layout = QVBoxLayout(params_group)
+        params_layout.setContentsMargins(4, 8, 12, 8)
         params_layout.setSpacing(14)
+        params_layout.setSizeConstraint(QVBoxLayout.SizeConstraint.SetMinimumSize)
 
         self.parse_mode_combo = QComboBox()
         self.parse_mode_combo.addItem(
@@ -1081,52 +1214,43 @@ class MainWindow(QMainWindow):
         )
         self.parse_mode_combo.setCurrentIndex(0)
         self.parse_mode_combo.currentIndexChanged.connect(self._on_parse_mode_changed)
-        params_layout.addWidget(QLabel("Режим парсинга"))
-        params_layout.addWidget(self.parse_mode_combo)
+        params_layout.addWidget(param_field_block("Режим парсинга", self.parse_mode_combo))
 
-        self.seller_label = QLabel("Ссылка на продавца")
+        self.seller_label = make_param_label("Ссылка на продавца")
         self.seller_label.setEnabled(False)
-        params_layout.addWidget(self.seller_label)
         self.seller_input = QLineEdit()
         self.seller_input.clear()
         self.seller_input.setEnabled(False)
         self.seller_input.setPlaceholderText(
             "Не требуется — общий каталог Ozon"
         )
-        params_layout.addWidget(self.seller_input)
+        params_layout.addWidget(param_field_block(self.seller_label, self.seller_input))
 
-        mode_row = QGridLayout()
-        mode_row.addWidget(QLabel("Режим браузера"), 0, 0)
+        mode_row = QHBoxLayout()
+        mode_row.setSpacing(12)
         self.browser_mode_combo = QComboBox()
         self.browser_mode_combo.addItem("Desktop", DESKTOP_MODE)
         self.browser_mode_combo.addItem("Мобильный", MOBILE_MODE)
-        mode_row.addWidget(self.browser_mode_combo, 1, 0)
-        mode_row.addWidget(QLabel("Авторизация"), 0, 1)
         self.auth_mode_combo = QComboBox()
         self.auth_mode_combo.addItem("Без авторизации", False)
         self.auth_mode_combo.addItem("С авторизацией", True)
-        mode_row.addWidget(self.auth_mode_combo, 1, 1)
+        mode_row.addWidget(param_field_block("Режим браузера", self.browser_mode_combo))
+        mode_row.addWidget(param_field_block("Авторизация", self.auth_mode_combo))
         params_layout.addLayout(mode_row)
 
         price_row = QHBoxLayout()
-        price_col_l = QVBoxLayout()
-        price_col_l.addWidget(QLabel("Цена от"))
+        price_row.setSpacing(12)
         self.min_price = QDoubleSpinBox()
         self.min_price.setRange(0, 9999999)
         self.min_price.setSuffix(" ₽")
-        price_col_l.addWidget(self.min_price)
-        price_col_r = QVBoxLayout()
-        price_col_r.addWidget(QLabel("Цена до"))
         self.max_price = QDoubleSpinBox()
         self.max_price.setRange(0, 9999999)
         self.max_price.setValue(999999)
         self.max_price.setSuffix(" ₽")
-        price_col_r.addWidget(self.max_price)
-        price_row.addLayout(price_col_l)
-        price_row.addLayout(price_col_r)
+        price_row.addWidget(param_field_block("Цена от", self.min_price))
+        price_row.addWidget(param_field_block("Цена до", self.max_price))
         params_layout.addLayout(price_row)
 
-        params_layout.addWidget(QLabel("Какие товары собирать"))
         self.product_filter_combo = QComboBox()
         self.product_filter_combo.addItem("Только с баллами за отзыв", True)
         self.product_filter_combo.addItem("Все товары", False)
@@ -1136,10 +1260,9 @@ class MainWindow(QMainWindow):
             "«Все товары» — любые товары из выбранных категорий в диапазоне цен."
         )
         self.product_filter_combo.currentIndexChanged.connect(self._on_product_filter_changed)
-        params_layout.addWidget(self.product_filter_combo)
+        params_layout.addWidget(param_field_block("Какие товары собирать", self.product_filter_combo))
 
-        self.max_products_label = QLabel("Количество товаров с баллами (на категорию)")
-        params_layout.addWidget(self.max_products_label)
+        self.max_products_label = make_param_label("Количество товаров с баллами (на категорию)")
         self.max_products = QSpinBox()
         self.max_products.setRange(1, 100000)
         self.max_products.setValue(100)
@@ -1148,11 +1271,10 @@ class MainWindow(QMainWindow):
             "каждые 25 товаров и каждые 400 (до 25 сек), "
             "чтобы снизить риск fab_/«нет соединения»."
         )
-        params_layout.addWidget(self.max_products)
+        params_layout.addWidget(param_field_block(self.max_products_label, self.max_products))
 
-        self.chrome_mode_label = QLabel("Парсер работает через Chrome")
+        self.chrome_mode_label = WrapLabel("Парсер работает через Chrome")
         self.chrome_mode_label.setObjectName("ChromeModeHint")
-        self.chrome_mode_label.setWordWrap(True)
         self.chrome_mode_label.setToolTip(
             "Chrome открывается автоматически при загрузке категорий и парсинге"
         )
@@ -1166,12 +1288,16 @@ class MainWindow(QMainWindow):
         self.auth_mode_combo.currentIndexChanged.connect(self._on_session_mode_changed)
         self._update_session_controls()
 
-        self.detail_status_label = QLabel("Загрузите категории, чтобы начать")
-        self.detail_status_label.setWordWrap(True)
+        self.detail_status_label = WrapLabel("Загрузите категории, чтобы начать")
         self.detail_status_label.setObjectName("DetailStatus")
+        self.detail_status_label.setMaximumHeight(48)
+        self.detail_status_label.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Maximum,
+        )
         params_layout.addWidget(self.detail_status_label)
 
-        params_layout.addStretch()
+        params_layout.addStretch(1)
 
         self.start_btn = QPushButton("Запустить парсер")
         self.start_btn.setObjectName("PrimaryButton")
@@ -1441,6 +1567,7 @@ class MainWindow(QMainWindow):
         btn_h = max(44, btn_fs * 2 + 8)
         input_fs = max(14, fs - 6)
         tree_fs = max(14, fs - 4)
+        input_h = max(40, input_fs + 18)
         theme = normalize_theme(self._theme)
         self.setStyleSheet(
             build_stylesheet(
@@ -1451,12 +1578,27 @@ class MainWindow(QMainWindow):
                 btn_h=btn_h,
                 input_fs=input_fs,
                 tree_fs=tree_fs,
+                input_h=input_h,
             )
         )
         if hasattr(self, "category_tree"):
             colors = THEMES[theme]
             self.category_tree.set_placeholder_color(colors.placeholder)
             self.category_tree.set_hierarchy_colors(colors.text_muted, colors.text_soft)
+        if hasattr(self, "max_products"):
+            for widget in (
+                self.parse_mode_combo,
+                self.seller_input,
+                self.browser_mode_combo,
+                self.auth_mode_combo,
+                self.min_price,
+                self.max_price,
+                self.product_filter_combo,
+                self.max_products,
+            ):
+                setup_param_input(widget, min_height=input_h)
+            for label in self.findChildren(WrapLabel):
+                label._sync_wrap_height()
 
     def _refresh_theme_button(self) -> None:
         if self._theme == "light":
@@ -1521,8 +1663,10 @@ class MainWindow(QMainWindow):
         self.progress_bar.setValue(0)
 
     def _on_worker_progress(self, message: str) -> None:
-        self.status_label.setText(message)
         self._append_log(message)
+        # Keep the params-panel status short so «Скачать XLSX» stays visible.
+        short = message if len(message) <= 90 else message[:87] + "..."
+        self.status_label.setText(short)
 
     def _reset_parse_display(self) -> None:
         self._reset_progress_panel()
@@ -1872,10 +2016,11 @@ class MainWindow(QMainWindow):
         sub_count = self._count_subcategories(branches)
         self.status_label.setText(
             f"Подкатегории загружены для {len(branches)} раздел(ов), "
-            f"внутри узлов: {sub_count}. Можно парсить."
+            f"внутри узлов: {sub_count}. Отметьте нужные галочками и запускайте парсер."
         )
         self._append_log(
-            f"Подкатегории готовы: {len(branches)} веток, {sub_count} узлов"
+            f"Подкатегории готовы: {len(branches)} веток, {sub_count} узлов. "
+            "Галочки сброшены — отметьте конкретные категории для парсинга."
         )
         self._update_selected_categories_count(
             len(self.category_tree.selected_leaf_categories())
@@ -1974,6 +2119,25 @@ class MainWindow(QMainWindow):
                 "Отметьте категории или подкатегории для парсинга.",
             )
             return
+
+        if needs_categories:
+            unresolved = [
+                c for c in categories
+                if not extract_ozon_category_id(c.category_id, c.param_value, c.id, c.url)
+            ]
+            if unresolved:
+                names = ", ".join(
+                    (c.name or c.category_name or c.id) for c in unresolved[:5]
+                )
+                QMessageBox.warning(
+                    self,
+                    "Категории без ID",
+                    "Не удалось определить ID у отмеченных категорий:\n"
+                    f"{names}\n\n"
+                    "Сбросьте галочки, загрузите подкатегории ещё раз и отметьте "
+                    "конкретные пункты в дереве.",
+                )
+                return
 
         if parse_mode == PARSE_MODE_GLOBAL_CATEGORIES and len(categories) >= 50:
             goal = self.max_products.value()
@@ -2078,6 +2242,12 @@ class MainWindow(QMainWindow):
             "Запуск безопасной сессии: короткие партии, сохранение прогресса, "
             "без открытия карточек товаров."
         )
+        if categories:
+            preview = ", ".join(
+                (c.name or c.category_name or c.id) for c in categories[:8]
+            )
+            more = f" … (+{len(categories) - 8})" if len(categories) > 8 else ""
+            self._append_log(f"К парсингу: {len(categories)} кат. — {preview}{more}")
         self._set_app_status(self.STATUS_PARSING, parsing=True)
         self.parser = OzonParser()
         self.parse_worker = ParseWorker(settings, self.parser, export_meta)
@@ -2092,6 +2262,7 @@ class MainWindow(QMainWindow):
 
         self.start_btn.setText("Остановить парсер")
         self.start_btn.setEnabled(True)
+        self.download_btn.setVisible(True)
         self.load_cat_btn.setEnabled(False)
 
     def _selected_targets_label(self, categories: list[CategoryTarget]) -> str:
